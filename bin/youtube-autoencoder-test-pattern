@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MPL-2.0
+"""Temporary moving test-pattern stream for YouTube AutoEncoder."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import selectors
+import signal
+import subprocess
+import sys
+import time
+from typing import Any
+from urllib.parse import urlsplit
+
+
+HOME = pathlib.Path.home()
+OBS_PROFILE_DIR = pathlib.Path(
+    os.environ.get("YTA_OBS_PROFILE_DIR", HOME / ".config/obs-studio/basic/profiles/YouTube_AutoEncoder")
+).expanduser()
+OBS_SERVICE_FILE = pathlib.Path(os.environ.get("YTA_OBS_SERVICE_FILE", OBS_PROFILE_DIR / "service.json")).expanduser()
+
+child: subprocess.Popen[Any] | None = None
+stopping = False
+
+
+def log(message: str) -> None:
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {message}", flush=True)
+
+
+def redact_url(url: str) -> str:
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    path = "/<redacted>" if "rtmp" in parts.scheme or "youtube" in host else parts.path
+    return f"{parts.scheme}://{host}{path}"
+
+
+def redact_text(text: str, secrets: list[str]) -> str:
+    redacted = text
+    for secret in secrets:
+        if not secret:
+            continue
+        redacted = redacted.replace(secret, redact_url(secret))
+        stream_key = urlsplit(secret).path.rsplit("/", 1)[-1]
+        if stream_key:
+            redacted = redacted.replace(stream_key, "<redacted>")
+    return redacted
+
+
+def youtube_url() -> str:
+    with OBS_SERVICE_FILE.open("r", encoding="utf-8") as handle:
+        settings = json.load(handle).get("settings") or {}
+    server = str(settings.get("server") or "").rstrip("/")
+    stream_key = str(settings.get("key") or "")
+    if not server or not stream_key:
+        raise ValueError(f"missing YouTube server/key in {OBS_SERVICE_FILE}")
+    return f"{server}/{stream_key}"
+
+
+def stop_child(signum: int, _frame: Any) -> None:
+    global stopping
+    stopping = True
+    if child and child.poll() is None:
+        log(f"received signal {signum}; stopping ffmpeg")
+        child.send_signal(signal.SIGINT)
+
+
+def ffmpeg_args(output_url: str) -> list[str]:
+    encoder = os.environ.get("YTA_TEST_ENCODER", "libx264")
+    size = os.environ.get("YTA_TEST_SIZE", "1280x720")
+    fps = os.environ.get("YTA_TEST_FPS", "30")
+    bitrate = os.environ.get("YTA_TEST_VIDEO_BITRATE", "4000k")
+    gop = os.environ.get("YTA_TEST_GOP", "60")
+    args = [
+        os.environ.get("YTA_FFMPEG", "ffmpeg"),
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        os.environ.get("YTA_TEST_LOGLEVEL", "warning"),
+        "-re",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size={size}:rate={fps}",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-vf",
+        "format=yuv420p",
+        "-c:v",
+        encoder,
+    ]
+    if encoder == "libx264":
+        args.extend(["-preset", "veryfast", "-tune", "zerolatency"])
+    args.extend(
+        [
+            "-b:v",
+            bitrate,
+            "-maxrate",
+            bitrate,
+            "-bufsize",
+            "8000k",
+            "-g",
+            gop,
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-f",
+            "flv",
+            output_url,
+        ]
+    )
+    return args
+
+
+def run(duration: int) -> int:
+    global child
+    output_url = youtube_url()
+    log(f"starting test pattern duration={duration}s target={redact_url(output_url)}")
+    child = subprocess.Popen(
+        ffmpeg_args(output_url),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    selector = selectors.DefaultSelector()
+    if child.stdout is not None:
+        selector.register(child.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + duration
+    try:
+        while child.poll() is None and not stopping:
+            for key, _mask in selector.select(timeout=1):
+                line = key.fileobj.readline()
+                if line:
+                    log("ffmpeg: " + redact_text(line.rstrip(), [output_url]))
+            if time.monotonic() >= deadline:
+                log("test duration reached; stopping ffmpeg")
+                child.send_signal(signal.SIGINT)
+                break
+        try:
+            rc = child.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            log("ffmpeg did not stop cleanly; killing")
+            child.kill()
+            rc = child.wait(timeout=10)
+        if child.stdout is not None:
+            for line in child.stdout:
+                log("ffmpeg: " + redact_text(line.rstrip(), [output_url]))
+        log(f"test pattern exited rc={rc}")
+        return 0 if rc in (0, 255) else rc
+    finally:
+        selector.close()
+        child = None
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, stop_child)
+    signal.signal(signal.SIGINT, stop_child)
+    duration = int(sys.argv[1]) if len(sys.argv) > 1 else 900
+    return run(duration)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

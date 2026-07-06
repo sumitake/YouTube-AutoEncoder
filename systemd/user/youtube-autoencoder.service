@@ -1,0 +1,20 @@
+[Unit]
+Description=YouTube AutoEncoder
+Documentation=https://github.com/sumitake/YouTube-AutoEncoder
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/youtube-autoencoder/youtube-autoencoder.env
+ExecStart=/usr/local/bin/youtube-autoencoder
+WorkingDirectory=%h
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=25
+Nice=5
+
+[Install]
+WantedBy=default.target

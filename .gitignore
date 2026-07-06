@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local config and secrets
+.env
+*.env
+google-oauth-client.json
+youtube-token.json
+youtube-live-state.json
+.config/
+
+# Runtime captures
+*.flv
+*.mkv
+*.mp4
