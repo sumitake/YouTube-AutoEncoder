@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import selectors
 import signal
 import subprocess
@@ -30,6 +31,9 @@ OBS_SCENE_FILE = pathlib.Path(
 
 child: subprocess.Popen[Any] | None = None
 stopping = False
+URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+(?::[^/\s@]*)?@")
+RTMP_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>rtmps?://[^\s/]+/)[^\s]+")
+YOUTUBE_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>https?://[^\s/]*(?:youtube|google)[^\s/]*/)[^\s]+")
 
 
 def log(message: str) -> None:
@@ -71,22 +75,10 @@ def redact_url(url: str) -> str:
     return f"{parts.scheme}://{host}{path}"
 
 
-def redact_text(text: str, secrets: list[str]) -> str:
-    redacted = text
-    for secret in secrets:
-        if not secret:
-            continue
-        redacted = redacted.replace(secret, redact_url(secret))
-        parts = urlsplit(secret)
-        if parts.password:
-            redacted = redacted.replace(parts.password, "<redacted>")
-        if parts.username:
-            redacted = redacted.replace(parts.username, "<redacted>")
-        if parts.path and ("youtube" in (parts.hostname or "") or "rtmp" in parts.scheme):
-            stream_key = parts.path.rsplit("/", 1)[-1]
-            if stream_key:
-                redacted = redacted.replace(stream_key, "<redacted>")
-    return redacted
+def redact_text(text: str) -> str:
+    redacted = URL_CREDENTIALS_RE.sub(r"\g<scheme><redacted>@", text)
+    redacted = RTMP_SECRET_PATH_RE.sub(r"\g<prefix><redacted>", redacted)
+    return YOUTUBE_SECRET_PATH_RE.sub(r"\g<prefix><redacted>", redacted)
 
 
 def load_json(path: pathlib.Path) -> dict[str, Any]:
@@ -172,11 +164,11 @@ def source_available(url: str) -> bool:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        log(f"source probe timed out source={redact_url(url)}")
+        log("source probe timed out")
         return False
     if result.returncode != 0:
-        details = redact_text((result.stderr or result.stdout).strip(), [url])
-        log(f"source probe failed: {details}" if details else f"source probe failed source={redact_url(url)}")
+        details = redact_text((result.stderr or result.stdout).strip())
+        log(f"source probe failed: {details}" if details else "source probe failed")
         return False
     return True
 
@@ -334,7 +326,7 @@ def run_once() -> int:
             raise RuntimeError("prepare-broadcast returned incomplete state")
         input_url, ingest_url = stream_config()
 
-    log(f"starting ffmpeg mode={env('YTA_MODE', 'copy')} source={redact_url(input_url)} target={redact_url(ingest_url)}")
+    log(f"starting ffmpeg mode={env('YTA_MODE', 'copy')}")
     child = subprocess.Popen(
         ffmpeg_args(input_url, ingest_url),
         stderr=subprocess.STDOUT,
@@ -355,7 +347,7 @@ def run_once() -> int:
             for key, _mask in selector.select(timeout=1):
                 line = key.fileobj.readline()
                 if line:
-                    log("ffmpeg: " + redact_text(line.rstrip(), [input_url, ingest_url]))
+                    log("ffmpeg: " + redact_text(line.rstrip()))
             if stopping:
                 break
             if max_runtime and time.monotonic() - started > max_runtime:
@@ -366,7 +358,7 @@ def run_once() -> int:
             rc = child.wait(timeout=20)
             if child.stdout is not None:
                 for line in child.stdout:
-                    log("ffmpeg: " + redact_text(line.rstrip(), [input_url, ingest_url]))
+                    log("ffmpeg: " + redact_text(line.rstrip()))
             return rc
         except subprocess.TimeoutExpired:
             log("ffmpeg did not stop cleanly; killing")
