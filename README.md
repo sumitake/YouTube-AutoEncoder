@@ -1,5 +1,9 @@
 # YouTube AutoEncoder
 
+[![CI](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/codeql.yml/badge.svg)](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/codeql.yml)
+[![Secret Scan](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/secret-scan.yml)
+
 YouTube AutoEncoder is a headless, self-recovering live-stream bridge for unattended RTSP-style cameras and YouTube Live. It is designed for small Linux hosts such as Raspberry Pi systems where a full OBS desktop stack is too heavy, but where the stream still needs to recover from camera power loss, encoder crashes, network interruptions, host reboots, and YouTube broadcast lifecycle edge cases.
 
 The project runs FFmpeg under systemd, optionally reuses OBS profile data for camera and stream-key compatibility, and can manage YouTube Live broadcasts through the YouTube Data API.
@@ -406,9 +410,9 @@ youtube-autoencoder-api complete
 
 Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full history.
 
-### 2026-07-06 - YouTube Provisioning Documentation
+### 2026-07-06 - Public Repository Hardening
 
-- Added Google Cloud, YouTube Data API, Google Auth Platform, OAuth client, device-code authorization, validation, and common-error instructions for fresh deployments.
+- Added CI, CodeQL, secret scanning, Dependabot, public contribution/security docs, issue templates, CODEOWNERS, and offline tests ahead of public release.
 
 ## Repository Layout
 

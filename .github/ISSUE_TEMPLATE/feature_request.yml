@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose an improvement or supported deployment path.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What operational problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the expected interface, configuration, or workflow.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Note hardware, OS, network, YouTube API, or camera constraints that shape the request.
+    validations:
+      required: false

@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible problem with YouTube AutoEncoder.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include OAuth client secrets, refresh tokens, YouTube stream keys, camera passwords, or public broadcast management URLs.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Python version, FFmpeg version, hardware, and install method.
+      placeholder: Raspberry Pi OS Bookworm, Python 3.11, FFmpeg 5.x, Raspberry Pi 5
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Redact secrets before pasting configuration or logs.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Include the smallest useful log excerpt with secrets redacted.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
