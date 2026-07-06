@@ -213,27 +213,141 @@ YTA_OBS_SOURCE_NAME=Camera RTSP
 
 The OBS service file supplies the reusable YouTube RTMPS server and stream key. If YouTube AutoEncoder creates a reusable stream through the API, it updates that service file.
 
-## YouTube Authorization
+## YouTube API and OAuth Provisioning
 
-Create a Google OAuth client and place the downloaded JSON at:
+YouTube AutoEncoder needs OAuth, not just an API key. The service creates and manages private YouTube resources such as `liveBroadcast` and `liveStream`, binds them together, and transitions broadcasts through `testing`, `live`, and `complete`. Those operations must be authorized by the Google account that owns or manages the YouTube channel.
+
+Official references:
+
+- [YouTube Live Streaming API Overview](https://developers.google.com/youtube/v3/live/getting-started)
+- [Obtaining authorization credentials](https://developers.google.com/youtube/registering_an_application)
+- [OAuth device flow for limited-input devices](https://developers.google.com/youtube/v3/guides/auth/devices)
+- [Google Auth Platform audience settings](https://support.google.com/cloud/answer/15549945)
+- [Google Auth Platform OAuth clients](https://support.google.com/cloud/answer/15549257)
+
+### 1. Prepare the YouTube Channel
+
+1. Sign in to YouTube Studio with the Google account that owns or manages the channel.
+2. Confirm that live streaming is enabled for the channel. New channels, restricted channels, or channels with policy holds may not be able to stream immediately.
+3. If the channel is a Brand Account, authorize with a Google account that can manage that Brand Account.
+
+### 2. Create or Select a Google Cloud Project
+
+1. Open the [Google Cloud Console](https://console.cloud.google.com/).
+2. Create a new project for the encoder, or select an existing project dedicated to this deployment.
+3. Open **APIs & Services > Library**.
+4. Enable **YouTube Data API v3** for the project.
+
+The Live Streaming API is exposed through the YouTube Data API v3 for the broadcast and stream operations this project uses.
+
+### 3. Configure Google Auth Platform
+
+Open **Google Auth Platform** for the same project and configure the app before creating the OAuth client.
+
+Audience:
+
+- Use **External** when the Google account authorizing the YouTube channel may be outside your Google Cloud Organization.
+- Use **Internal** only when every authorizing account is in the same Google Cloud Organization as the project.
+- If you see `org_internal` during authorization, the OAuth app is limited to organization users. Change the audience to External or authorize with an account inside that organization.
+
+Publishing status:
+
+- **Testing** is fine for initial setup. Add the streaming Google account as a test user before authorizing.
+- Testing-mode authorizations for non-basic scopes can expire after seven days, including refresh tokens. For unattended deployments, move the app to **In production** and complete any required Google verification.
+- In production, users may see an unverified-app warning until Google verifies the app and requested scopes.
+
+Data access / scopes:
+
+- Add `https://www.googleapis.com/auth/youtube`.
+- This scope is broad, but it is the scope this project uses to manage YouTube Live broadcasts and streams.
+- Avoid adding extra scopes unless the code actually needs them; additional sensitive or restricted scopes can increase verification requirements.
+
+Branding:
+
+- Use an app name that identifies the deployment, such as `YouTube AutoEncoder`.
+- Provide a monitored support email.
+- Add privacy policy, terms, and authorized domain information if Google requires them for your app state.
+
+### 4. Create the OAuth Client
+
+1. Open **Google Auth Platform > Clients**.
+2. Click **Create client**.
+3. Choose **TVs and Limited Input devices** where available. This matches the device-code flow used by `youtube-autoencoder-api authorize`.
+4. Name the client, for example `YouTube AutoEncoder`.
+5. Create the client and download the JSON credentials.
+
+If the console only offers a generic installed-app flow in your environment, use the device or installed/native option intended for command-line or limited-input devices. If authorization later fails with `invalid_client`, create a new client with the explicit **TVs and Limited Input devices** application type.
+
+### 5. Install the OAuth Client JSON
+
+Copy the downloaded JSON to the service user's config directory:
 
 ```text
 ~/.config/youtube-autoencoder/google-oauth-client.json
 ```
 
-Run:
+Lock down the file:
+
+```bash
+chmod 600 ~/.config/youtube-autoencoder/google-oauth-client.json
+```
+
+The file contains OAuth client credentials. Do not commit it, paste it into issue trackers, or store it in a world-readable location.
+
+### 6. Authorize the Encoder
 
 ```bash
 youtube-autoencoder-api authorize
 ```
 
-Open the displayed device-flow URL, enter the code, and approve access for the YouTube channel account. The refresh token is stored in:
+The command prints a verification URL and user code. Open the URL on any browser-capable device, enter the code, and approve access with the Google account that owns or manages the target YouTube channel.
+
+After approval, the helper stores the OAuth token cache at:
 
 ```text
 ~/.config/youtube-autoencoder/youtube-token.json
 ```
 
-Keep both files private.
+Lock down the token file:
+
+```bash
+chmod 600 ~/.config/youtube-autoencoder/youtube-token.json
+```
+
+Keep this file private. It contains the refresh token used for unattended operation.
+
+### 7. Validate the YouTube API Setup
+
+If you already have an OBS-compatible `service.json` with a YouTube stream key:
+
+```bash
+youtube-autoencoder-api status
+```
+
+For a fresh setup where the reusable YouTube stream should be created automatically, make sure the service user can write the configured OBS service file and set:
+
+```text
+YTA_YOUTUBE_CREATE_STREAM=true
+```
+
+Then run an API-managed visible test after the rest of the encoder config is in place:
+
+```bash
+youtube-autoencoder-api run-visible-test --duration 900 --privacy unlisted --create-stream
+```
+
+This validates OAuth, the reusable stream, broadcast creation, stream binding, ingest detection, transition to `testing`, transition to `live`, and broadcast completion.
+
+### Common Authorization Problems
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `org_internal` | OAuth app audience is Internal and the authorizing account is outside the project's Google Cloud Organization. | Change the app audience to External, or authorize with an account inside the organization. |
+| `invalid_client` | OAuth client type does not support the device-code flow. | Create a client for TVs and Limited Input devices, then replace `google-oauth-client.json`. |
+| `authorization_pending` | The browser approval has not completed yet. | Finish the device-code flow; the CLI will keep polling until the code expires. |
+| `slow_down` | Polling is too frequent. | The helper backs off automatically. |
+| Token works briefly then expires | App is still in Testing mode. | Add the correct test user for setup, then move the app to In production for unattended use and complete required verification. |
+| API calls fail despite valid OAuth | The account does not own/manage the YouTube channel, live streaming is not enabled, or quota/policy blocks the operation. | Reauthorize with the right channel account, enable live streaming, and check project quota and YouTube Studio restrictions. |
 
 ## Operations
 
@@ -292,10 +406,9 @@ youtube-autoencoder-api complete
 
 Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full history.
 
-### 2026-07-06 - Executive Summary Documentation
+### 2026-07-06 - YouTube Provisioning Documentation
 
-- Expanded the README into an executive summary covering architecture, runtime process flow, operational commands, recovery behavior, and caveats.
-- Added a standalone changelog so the README can show only the newest entry.
+- Added Google Cloud, YouTube Data API, Google Auth Platform, OAuth client, device-code authorization, validation, and common-error instructions for fresh deployments.
 
 ## Repository Layout
 

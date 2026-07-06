@@ -2,6 +2,11 @@
 
 All notable project changes are recorded here. The README shows only the most recent entry.
 
+## 2026-07-06 - YouTube Provisioning Documentation
+
+- Added Google Cloud, YouTube Data API, Google Auth Platform, OAuth client, device-code authorization, validation, and common-error instructions for fresh deployments.
+- Documented the `org_internal`, `invalid_client`, testing-mode token expiry, and channel-permission failure modes observed during setup.
+
 ## 2026-07-06 - Executive Summary Documentation
 
 - Expanded the README into an executive summary covering architecture, runtime process flow, operational commands, recovery behavior, and caveats.
