@@ -19,10 +19,12 @@ def test_redacts_credentials_and_stream_keys(load_script):
     assert supervisor.redact_url(camera_url) == "rtsp://<redacted>@camera.local:554/stream1"
     assert supervisor.redact_url(ingest_url) == "rtmps://a.rtmp.youtube.com/<redacted>"
 
-    redacted = supervisor.redact_text(f"input={camera_url} output={ingest_url}", [camera_url, ingest_url])
+    redacted = supervisor.redact_text(f"input={camera_url} output={ingest_url}")
     assert "user" not in redacted
     assert "pass" not in redacted
     assert "secret-stream-key" not in redacted
+    assert "rtsp://<redacted>@camera.local:554/stream1" in redacted
+    assert "rtmps://a.rtmp.youtube.com/<redacted>" in redacted
 
 
 def test_selected_vlc_url_prefers_named_selected_source(load_script, monkeypatch):

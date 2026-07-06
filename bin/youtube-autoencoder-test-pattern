@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import selectors
 import signal
 import subprocess
@@ -24,6 +25,8 @@ OBS_SERVICE_FILE = pathlib.Path(os.environ.get("YTA_OBS_SERVICE_FILE", OBS_PROFI
 
 child: subprocess.Popen[Any] | None = None
 stopping = False
+URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+(?::[^/\s@]*)?@")
+RTMP_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>rtmps?://[^\s/]+/)[^\s]+")
 
 
 def log(message: str) -> None:
@@ -39,16 +42,9 @@ def redact_url(url: str) -> str:
     return f"{parts.scheme}://{host}{path}"
 
 
-def redact_text(text: str, secrets: list[str]) -> str:
-    redacted = text
-    for secret in secrets:
-        if not secret:
-            continue
-        redacted = redacted.replace(secret, redact_url(secret))
-        stream_key = urlsplit(secret).path.rsplit("/", 1)[-1]
-        if stream_key:
-            redacted = redacted.replace(stream_key, "<redacted>")
-    return redacted
+def redact_text(text: str) -> str:
+    redacted = URL_CREDENTIALS_RE.sub(r"\g<scheme><redacted>@", text)
+    return RTMP_SECRET_PATH_RE.sub(r"\g<prefix><redacted>", redacted)
 
 
 def youtube_url() -> str:
@@ -126,7 +122,7 @@ def ffmpeg_args(output_url: str) -> list[str]:
 def run(duration: int) -> int:
     global child
     output_url = youtube_url()
-    log(f"starting test pattern duration={duration}s target={redact_url(output_url)}")
+    log(f"starting test pattern duration={duration}s")
     child = subprocess.Popen(
         ffmpeg_args(output_url),
         stdout=subprocess.PIPE,
@@ -143,7 +139,7 @@ def run(duration: int) -> int:
             for key, _mask in selector.select(timeout=1):
                 line = key.fileobj.readline()
                 if line:
-                    log("ffmpeg: " + redact_text(line.rstrip(), [output_url]))
+                    log("ffmpeg: " + redact_text(line.rstrip()))
             if time.monotonic() >= deadline:
                 log("test duration reached; stopping ffmpeg")
                 child.send_signal(signal.SIGINT)
@@ -156,7 +152,7 @@ def run(duration: int) -> int:
             rc = child.wait(timeout=10)
         if child.stdout is not None:
             for line in child.stdout:
-                log("ffmpeg: " + redact_text(line.rstrip(), [output_url]))
+                log("ffmpeg: " + redact_text(line.rstrip()))
         log(f"test pattern exited rc={rc}")
         return 0 if rc in (0, 255) else rc
     finally:
