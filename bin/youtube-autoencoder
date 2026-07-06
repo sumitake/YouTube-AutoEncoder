@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MPL-2.0
+"""Headless YouTube live encoder supervisor."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import selectors
+import signal
+import subprocess
+import sys
+import time
+from typing import Any
+from urllib.parse import urlsplit
+
+
+HOME = pathlib.Path.home()
+OBS_PROFILE_DIR = pathlib.Path(
+    os.environ.get(
+        "YTA_OBS_PROFILE_DIR",
+        HOME / ".config/obs-studio/basic/profiles/YouTube_AutoEncoder",
+    )
+).expanduser()
+OBS_SERVICE_FILE = pathlib.Path(os.environ.get("YTA_OBS_SERVICE_FILE", OBS_PROFILE_DIR / "service.json")).expanduser()
+OBS_SCENE_FILE = pathlib.Path(
+    os.environ.get("YTA_OBS_SCENE_FILE", HOME / ".config/obs-studio/basic/scenes/Untitled.json")
+).expanduser()
+
+child: subprocess.Popen[Any] | None = None
+stopping = False
+
+
+def log(message: str) -> None:
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {message}", flush=True)
+
+
+def env(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    return default if value is None or value == "" else value
+
+
+def bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_duration(value: str) -> float:
+    value = value.strip().lower()
+    if not value or value == "0":
+        return 0.0
+    suffix = value[-1]
+    number = value[:-1] if suffix in "smhd" else value
+    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(suffix, 1)
+    return float(number) * multiplier
+
+
+def redact_url(url: str) -> str:
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    if parts.username or parts.password:
+        host = f"<redacted>@{host}"
+    path = parts.path or ""
+    if "youtube" in host or "google" in host or "rtmp" in parts.scheme:
+        path = "/<redacted>"
+    return f"{parts.scheme}://{host}{path}"
+
+
+def redact_text(text: str, secrets: list[str]) -> str:
+    redacted = text
+    for secret in secrets:
+        if not secret:
+            continue
+        redacted = redacted.replace(secret, redact_url(secret))
+        parts = urlsplit(secret)
+        if parts.password:
+            redacted = redacted.replace(parts.password, "<redacted>")
+        if parts.username:
+            redacted = redacted.replace(parts.username, "<redacted>")
+        if parts.path and ("youtube" in (parts.hostname or "") or "rtmp" in parts.scheme):
+            stream_key = parts.path.rsplit("/", 1)[-1]
+            if stream_key:
+                redacted = redacted.replace(stream_key, "<redacted>")
+    return redacted
+
+
+def load_json(path: pathlib.Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} did not contain a JSON object")
+    return data
+
+
+def selected_vlc_url(scene: dict[str, Any]) -> str:
+    source_name = os.environ.get("YTA_OBS_SOURCE_NAME")
+    fallback_url = ""
+    for source in scene.get("sources", []):
+        if not isinstance(source, dict) or source.get("id") != "vlc_source":
+            continue
+        if source_name and source.get("name") != source_name:
+            continue
+        playlist = (source.get("settings") or {}).get("playlist") or []
+        for item in playlist:
+            if not isinstance(item, dict):
+                continue
+            candidate = item.get("value") or item.get("url") or item.get("path")
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            if item.get("selected") and (not source_name or source.get("name") == source_name):
+                return candidate
+            if not fallback_url:
+                fallback_url = candidate
+    if fallback_url:
+        return fallback_url
+    raise ValueError(f"no VLC/RTSP source found in {OBS_SCENE_FILE}")
+
+
+def source_url() -> str:
+    direct = os.environ.get("YTA_SOURCE_URL")
+    if direct:
+        return direct
+    return selected_vlc_url(load_json(OBS_SCENE_FILE))
+
+
+def output_url() -> str:
+    settings = load_json(OBS_SERVICE_FILE).get("settings") or {}
+    server = str(settings.get("server") or "").rstrip("/")
+    stream_key = str(settings.get("key") or "")
+    if not server or not stream_key:
+        raise ValueError(f"missing YouTube server/key in {OBS_SERVICE_FILE}")
+    return f"{server}/{stream_key}"
+
+
+def stream_config() -> tuple[str, str]:
+    return source_url(), output_url()
+
+
+def source_available(url: str) -> bool:
+    if not bool_env("YTA_SOURCE_PROBE", True):
+        return True
+    cmd = [
+        env("YTA_FFPROBE", "ffprobe"),
+        "-hide_banner",
+        "-v",
+        "error",
+        "-rtsp_transport",
+        env("YTA_RTSP_TRANSPORT", "tcp"),
+        "-timeout",
+        env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000"),
+        "-rw_timeout",
+        env("YTA_RTSP_RW_TIMEOUT_US", "15000000"),
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,width,height",
+        "-of",
+        "json",
+        url,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=int(float(env("YTA_SOURCE_PROBE_TIMEOUT_SEC", "12"))),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"source probe timed out source={redact_url(url)}")
+        return False
+    if result.returncode != 0:
+        details = redact_text((result.stderr or result.stdout).strip(), [url])
+        log(f"source probe failed: {details}" if details else f"source probe failed source={redact_url(url)}")
+        return False
+    return True
+
+
+def lifecycle_enabled() -> bool:
+    return bool_env("YTA_YOUTUBE_LIFECYCLE", True)
+
+
+def api_command(args: list[str], *, timeout: int = 90) -> dict[str, Any]:
+    cmd = [env("YTA_YOUTUBE_API", "youtube-autoencoder-api"), *args]
+    result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    if result.returncode != 0:
+        output = (result.stdout + "\n" + result.stderr).strip()
+        raise RuntimeError(f"YouTube API command failed rc={result.returncode}: {output}")
+    output = result.stdout.strip()
+    return json.loads(output) if output else {}
+
+
+def prepare_broadcast() -> dict[str, Any]:
+    args = [
+        "prepare-broadcast",
+        "--privacy",
+        env("YTA_YOUTUBE_PRIVACY", "unlisted"),
+        "--title-prefix",
+        env("YTA_YOUTUBE_TITLE_PREFIX", "AutoEncoder Live"),
+    ]
+    title = os.environ.get("YTA_YOUTUBE_TITLE")
+    if title:
+        args.extend(["--title", title])
+    if bool_env("YTA_YOUTUBE_CREATE_STREAM", True):
+        args.append("--create-stream")
+    state = api_command(args, timeout=120)
+    log(
+        "prepared YouTube broadcast "
+        f"broadcast_id={state.get('last_broadcast_id')} stream_id={state.get('last_stream_id')}"
+    )
+    return state
+
+
+def wait_stream_active(stream_id: str) -> None:
+    timeout = int(float(env("YTA_YOUTUBE_WAIT_ACTIVE_SEC", "180")))
+    result = api_command(["wait-stream-active", stream_id, "--timeout", str(timeout)], timeout=timeout + 30)
+    log(f"YouTube ingest active stream_id={result.get('stream_id')} health={result.get('health')}")
+
+
+def transition_broadcast(broadcast_id: str, status: str) -> None:
+    result = api_command(["transition", status, broadcast_id], timeout=90)
+    lifecycle = (result.get("status") or {}).get("lifeCycleStatus")
+    log(f"YouTube broadcast transition status={status} lifecycle={lifecycle}")
+
+
+def complete_broadcast(broadcast_id: str) -> None:
+    try:
+        transition_broadcast(broadcast_id, "complete")
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not complete YouTube broadcast {broadcast_id}: {exc}")
+
+
+def ffmpeg_args(input_url: str, ingest_url: str) -> list[str]:
+    mode = env("YTA_MODE", "copy").lower()
+    audio_rate = env("YTA_AUDIO_SAMPLE_RATE", "48000")
+    args = [
+        env("YTA_FFMPEG", "ffmpeg"),
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        env("YTA_LOGLEVEL", "info"),
+        "-fflags",
+        "+genpts",
+        "-rtsp_transport",
+        env("YTA_RTSP_TRANSPORT", "tcp"),
+        "-timeout",
+        env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000"),
+        "-rw_timeout",
+        env("YTA_RTSP_RW_TIMEOUT_US", "15000000"),
+        "-i",
+        input_url,
+        "-f",
+        "lavfi",
+        "-i",
+        f"anullsrc=channel_layout=stereo:sample_rate={audio_rate}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+    ]
+    if mode == "copy":
+        args.extend(["-c:v", "copy"])
+    elif mode == "transcode":
+        encoder = env("YTA_TRANSCODE_ENCODER", "libx264")
+        args.extend(
+            [
+                "-vf",
+                f"scale={env('YTA_TRANSCODE_SCALE', '-2:720')},"
+                f"fps={env('YTA_FPS', '30')},format=yuv420p",
+                "-c:v",
+                encoder,
+                "-b:v",
+                env("YTA_VIDEO_BITRATE", "4000k"),
+                "-maxrate",
+                env("YTA_VIDEO_MAXRATE", env("YTA_VIDEO_BITRATE", "4000k")),
+                "-bufsize",
+                env("YTA_VIDEO_BUFSIZE", "8000k"),
+                "-g",
+                env("YTA_GOP", "60"),
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+        if encoder == "libx264":
+            args.extend(["-preset", env("YTA_X264_PRESET", "veryfast"), "-tune", "zerolatency"])
+    else:
+        raise ValueError("YTA_MODE must be 'copy' or 'transcode'")
+    args.extend(
+        [
+            "-c:a",
+            "aac",
+            "-b:a",
+            env("YTA_AUDIO_BITRATE", "128k"),
+            "-ar",
+            audio_rate,
+            "-ac",
+            "2",
+            "-shortest",
+            "-f",
+            "flv",
+            ingest_url,
+        ]
+    )
+    return args
+
+
+def stop_child(signum: int, _frame: Any) -> None:
+    global stopping
+    stopping = True
+    if child and child.poll() is None:
+        log(f"received signal {signum}; stopping ffmpeg")
+        child.send_signal(signal.SIGINT)
+
+
+def run_once() -> int:
+    global child
+    input_url, ingest_url = stream_config()
+    max_runtime = parse_duration(env("YTA_MAX_RUNTIME", "0"))
+    started = time.monotonic()
+    broadcast_id = ""
+    stream_id = ""
+    if not source_available(input_url):
+        return 1
+    if lifecycle_enabled():
+        state = prepare_broadcast()
+        broadcast_id = str(state.get("last_broadcast_id") or "")
+        stream_id = str(state.get("last_stream_id") or "")
+        if not broadcast_id or not stream_id:
+            raise RuntimeError("prepare-broadcast returned incomplete state")
+        input_url, ingest_url = stream_config()
+
+    log(f"starting ffmpeg mode={env('YTA_MODE', 'copy')} source={redact_url(input_url)} target={redact_url(ingest_url)}")
+    child = subprocess.Popen(
+        ffmpeg_args(input_url, ingest_url),
+        stderr=subprocess.STDOUT,
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    selector = selectors.DefaultSelector()
+    if child.stdout is not None:
+        selector.register(child.stdout, selectors.EVENT_READ)
+    try:
+        if lifecycle_enabled():
+            wait_stream_active(stream_id)
+            transition_broadcast(broadcast_id, "testing")
+            time.sleep(int(float(env("YTA_YOUTUBE_TESTING_DELAY_SEC", "8"))))
+            transition_broadcast(broadcast_id, "live")
+        while child.poll() is None:
+            for key, _mask in selector.select(timeout=1):
+                line = key.fileobj.readline()
+                if line:
+                    log("ffmpeg: " + redact_text(line.rstrip(), [input_url, ingest_url]))
+            if stopping:
+                break
+            if max_runtime and time.monotonic() - started > max_runtime:
+                log(f"max runtime {max_runtime:.0f}s reached; rotating ffmpeg")
+                child.send_signal(signal.SIGINT)
+                break
+        try:
+            rc = child.wait(timeout=20)
+            if child.stdout is not None:
+                for line in child.stdout:
+                    log("ffmpeg: " + redact_text(line.rstrip(), [input_url, ingest_url]))
+            return rc
+        except subprocess.TimeoutExpired:
+            log("ffmpeg did not stop cleanly; killing")
+            child.kill()
+            return child.wait(timeout=10)
+    finally:
+        if child and child.poll() is None:
+            log("stopping ffmpeg after interrupted stream attempt")
+            child.send_signal(signal.SIGINT)
+            try:
+                child.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                log("ffmpeg did not stop cleanly; killing")
+                child.kill()
+                child.wait(timeout=10)
+        if broadcast_id and bool_env("YTA_YOUTUBE_COMPLETE_ON_EXIT", True):
+            complete_broadcast(broadcast_id)
+        selector.close()
+        child = None
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, stop_child)
+    signal.signal(signal.SIGINT, stop_child)
+    delay = parse_duration(env("YTA_RESTART_DELAY", "10s"))
+    while not stopping:
+        try:
+            rc = run_once()
+            log(f"stream attempt exited rc={rc}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"streamer setup failed: {exc}")
+        if not stopping:
+            log(f"restarting in {delay:.0f}s")
+            time.sleep(delay)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

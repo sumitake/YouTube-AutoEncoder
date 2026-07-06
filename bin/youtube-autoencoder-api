@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MPL-2.0
+"""YouTube Live API controller for YouTube AutoEncoder."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import selectors
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+
+HOME = pathlib.Path.home()
+BASE_DIR = pathlib.Path(os.environ.get("YTA_CONFIG_DIR", HOME / ".config/youtube-autoencoder")).expanduser()
+CLIENT_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_CLIENT_FILE", BASE_DIR / "google-oauth-client.json")).expanduser()
+TOKEN_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_TOKEN_FILE", BASE_DIR / "youtube-token.json")).expanduser()
+STATE_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_STATE_FILE", BASE_DIR / "youtube-live-state.json")).expanduser()
+OBS_PROFILE_DIR = pathlib.Path(
+    os.environ.get("YTA_OBS_PROFILE_DIR", HOME / ".config/obs-studio/basic/profiles/YouTube_AutoEncoder")
+).expanduser()
+OBS_SERVICE_FILE = pathlib.Path(os.environ.get("YTA_OBS_SERVICE_FILE", OBS_PROFILE_DIR / "service.json")).expanduser()
+SCOPES = "https://www.googleapis.com/auth/youtube"
+API_BASE = "https://www.googleapis.com/youtube/v3"
+
+child: subprocess.Popen[Any] | None = None
+stopping = False
+
+
+def log(message: str) -> None:
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {message}", file=sys.stderr, flush=True)
+
+
+def read_json(path: pathlib.Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return data
+
+
+def write_secret_json(path: pathlib.Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    os.chmod(path, 0o600)
+
+
+def client_config() -> dict[str, str]:
+    data = read_json(CLIENT_FILE)
+    if "installed" in data:
+        data = data["installed"]
+    elif "web" in data:
+        data = data["web"]
+    client_id = str(data.get("client_id") or "")
+    client_secret = str(data.get("client_secret") or "")
+    if not client_id or not client_secret:
+        raise ValueError(f"{CLIENT_FILE} must contain client_id and client_secret")
+    return {"client_id": client_id, "client_secret": client_secret}
+
+
+def http_json(
+    method: str,
+    url: str,
+    *,
+    token: str | None = None,
+    form: dict[str, str] | None = None,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    headers: dict[str, str] = {"Accept": "application/json"}
+    data: bytes | None = None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = {"error": raw}
+        raise RuntimeError(f"HTTP {exc.code} {url}: {json.dumps(parsed, sort_keys=True)}") from exc
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"unexpected JSON response from {url}")
+    return parsed
+
+
+def authorize(_args: argparse.Namespace) -> int:
+    cfg = client_config()
+    device = http_json(
+        "POST",
+        "https://oauth2.googleapis.com/device/code",
+        form={"client_id": cfg["client_id"], "scope": SCOPES},
+    )
+    print()
+    print("Authorize YouTube AutoEncoder:")
+    print(f"  Open: {device['verification_url']}")
+    print(f"  Code: {device['user_code']}")
+    print()
+    print("Waiting for authorization...")
+
+    interval = int(device.get("interval") or 5)
+    expires_at = time.monotonic() + int(device.get("expires_in") or 1800)
+    while time.monotonic() < expires_at:
+        time.sleep(interval)
+        try:
+            token_data = http_json(
+                "POST",
+                "https://oauth2.googleapis.com/token",
+                form={
+                    "client_id": cfg["client_id"],
+                    "client_secret": cfg["client_secret"],
+                    "device_code": str(device["device_code"]),
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+            )
+        except RuntimeError as exc:
+            text = str(exc)
+            if "authorization_pending" in text:
+                continue
+            if "slow_down" in text:
+                interval += 5
+                continue
+            raise
+        token_data["created_at"] = int(time.time())
+        write_secret_json(TOKEN_FILE, token_data)
+        print(f"Saved token to {TOKEN_FILE}")
+        return 0
+    raise TimeoutError("OAuth device code expired before authorization completed")
+
+
+def token() -> str:
+    if not TOKEN_FILE.exists():
+        raise FileNotFoundError("missing token file; run: youtube-autoencoder-api authorize")
+    data = read_json(TOKEN_FILE)
+    expires_at = int(data.get("created_at") or 0) + int(data.get("expires_in") or 0) - 120
+    if data.get("access_token") and time.time() < expires_at:
+        return str(data["access_token"])
+
+    refresh_token = str(data.get("refresh_token") or "")
+    if not refresh_token:
+        raise ValueError("token file has no refresh_token; rerun authorization")
+    cfg = client_config()
+    refreshed = http_json(
+        "POST",
+        "https://oauth2.googleapis.com/token",
+        form={
+            "client_id": cfg["client_id"],
+            "client_secret": cfg["client_secret"],
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+    )
+    data.update(refreshed)
+    data["refresh_token"] = refresh_token
+    data["created_at"] = int(time.time())
+    write_secret_json(TOKEN_FILE, data)
+    return str(data["access_token"])
+
+
+def api(method: str, path: str, params: dict[str, str], body: dict[str, Any] | None = None) -> dict[str, Any]:
+    query = urllib.parse.urlencode(params)
+    return http_json(method, f"{API_BASE}{path}?{query}", token=token(), body=body)
+
+
+def obs_stream_name() -> str:
+    settings = read_json(OBS_SERVICE_FILE).get("settings") or {}
+    stream_name = str(settings.get("key") or "")
+    if not stream_name:
+        raise ValueError(f"missing OBS stream key in {OBS_SERVICE_FILE}")
+    return stream_name
+
+
+def list_streams() -> list[dict[str, Any]]:
+    data = api(
+        "GET",
+        "/liveStreams",
+        {"part": "id,snippet,cdn,status,contentDetails", "mine": "true", "maxResults": "50"},
+    )
+    return list(data.get("items") or [])
+
+
+def find_obs_stream() -> dict[str, Any]:
+    stream_name = obs_stream_name()
+    for stream in list_streams():
+        ingestion = ((stream.get("cdn") or {}).get("ingestionInfo") or {})
+        if ingestion.get("streamName") == stream_name:
+            return stream
+    raise LookupError("no YouTube liveStream matched the configured OBS stream key")
+
+
+def create_stream() -> dict[str, Any]:
+    body = {
+        "snippet": {
+            "title": os.environ.get("YTA_YOUTUBE_STREAM_TITLE", "YouTube AutoEncoder Stream"),
+            "description": "Reusable stream for YouTube AutoEncoder.",
+        },
+        "cdn": {
+            "ingestionType": "rtmp",
+            "resolution": os.environ.get("YTA_YOUTUBE_STREAM_RESOLUTION", "720p"),
+            "frameRate": os.environ.get("YTA_YOUTUBE_STREAM_FRAMERATE", "30fps"),
+        },
+        "contentDetails": {"isReusable": True},
+    }
+    return api("POST", "/liveStreams", {"part": "snippet,cdn,contentDetails,status"}, body)
+
+
+def save_stream_to_obs(stream: dict[str, Any]) -> None:
+    ingestion = ((stream.get("cdn") or {}).get("ingestionInfo") or {})
+    stream_name = ingestion.get("streamName")
+    server = ingestion.get("rtmpsIngestionAddress") or ingestion.get("ingestionAddress")
+    if not stream_name or not server:
+        raise ValueError("created stream did not return ingestion URL and stream name")
+    service = read_json(OBS_SERVICE_FILE)
+    service.setdefault("settings", {})
+    service["settings"]["server"] = server
+    service["settings"]["key"] = stream_name
+    write_secret_json(OBS_SERVICE_FILE, service)
+
+
+def ensure_stream(create_if_missing: bool = False) -> dict[str, Any]:
+    try:
+        return find_obs_stream()
+    except LookupError:
+        if not create_if_missing:
+            raise
+    stream = create_stream()
+    save_stream_to_obs(stream)
+    log("created reusable YouTube stream and updated OBS service.json")
+    return stream
+
+
+def create_broadcast(title: str, privacy: str) -> dict[str, Any]:
+    start_time = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    body = {
+        "snippet": {
+            "title": title,
+            "description": "Started by YouTube AutoEncoder.",
+            "scheduledStartTime": start_time,
+        },
+        "contentDetails": {
+            "enableDvr": True,
+            "recordFromStart": True,
+            "monitorStream": {"enableMonitorStream": True},
+        },
+        "status": {
+            "privacyStatus": privacy,
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+    return api("POST", "/liveBroadcasts", {"part": "snippet,contentDetails,status"}, body)
+
+
+def bind_broadcast(broadcast_id: str, stream_id: str) -> dict[str, Any]:
+    return api(
+        "POST",
+        "/liveBroadcasts/bind",
+        {"part": "id,snippet,contentDetails,status", "id": broadcast_id, "streamId": stream_id},
+    )
+
+
+def stream_by_id(stream_id: str) -> dict[str, Any]:
+    data = api("GET", "/liveStreams", {"part": "id,snippet,cdn,status,contentDetails", "id": stream_id})
+    items = data.get("items") or []
+    if not items:
+        raise LookupError(f"liveStream not found: {stream_id}")
+    return items[0]
+
+
+def wait_stream_active(stream_id: str, timeout: int) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        stream = stream_by_id(stream_id)
+        stream_status = (stream.get("status") or {}).get("streamStatus")
+        if stream_status == "active":
+            return stream
+        if stream_status != last:
+            log(f"YouTube stream status={stream_status}")
+            last = stream_status
+        time.sleep(5)
+    raise TimeoutError(f"stream {stream_id} did not become active within {timeout}s")
+
+
+def transition(broadcast_id: str, status: str) -> dict[str, Any]:
+    return api(
+        "POST",
+        "/liveBroadcasts/transition",
+        {"part": "id,snippet,contentDetails,status", "id": broadcast_id, "broadcastStatus": status},
+    )
+
+
+def write_state(data: dict[str, Any]) -> None:
+    write_secret_json(STATE_FILE, data)
+
+
+def prepare_broadcast(args: argparse.Namespace) -> int:
+    stream = ensure_stream(create_if_missing=args.create_stream)
+    stream_id = str(stream["id"])
+    title = args.title or f"{args.title_prefix} {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    broadcast = create_broadcast(title, args.privacy)
+    broadcast_id = str(broadcast["id"])
+    bind_broadcast(broadcast_id, stream_id)
+    state = {
+        "last_broadcast_id": broadcast_id,
+        "last_stream_id": stream_id,
+        "title": title,
+        "privacy": args.privacy,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    write_state(state)
+    print(json.dumps(state, indent=2, sort_keys=True))
+    return 0
+
+
+def wait_active_command(args: argparse.Namespace) -> int:
+    stream_id = args.stream_id or str(read_json(STATE_FILE).get("last_stream_id") or "")
+    if not stream_id:
+        raise ValueError("no stream id provided and no previous state file found")
+    stream = wait_stream_active(stream_id, args.timeout)
+    print(
+        json.dumps(
+            {
+                "stream_id": stream.get("id"),
+                "stream_status": ((stream.get("status") or {}).get("streamStatus")),
+                "health": (((stream.get("status") or {}).get("healthStatus") or {}).get("status")),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def status(_args: argparse.Namespace) -> int:
+    stream = ensure_stream(create_if_missing=False)
+    print(
+        json.dumps(
+            {
+                "stream_id": stream.get("id"),
+                "stream_title": (stream.get("snippet") or {}).get("title"),
+                "stream_status": ((stream.get("status") or {}).get("streamStatus")),
+                "health": (((stream.get("status") or {}).get("healthStatus") or {}).get("status")),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def stop_child(signum: int, _frame: Any) -> None:
+    global stopping
+    stopping = True
+    if child and child.poll() is None:
+        log(f"received signal {signum}; stopping test pattern")
+        child.send_signal(signal.SIGINT)
+
+
+def run_visible_test(args: argparse.Namespace) -> int:
+    global child
+    stream = ensure_stream(create_if_missing=args.create_stream)
+    stream_id = str(stream["id"])
+    title = args.title or f"AutoEncoder Test Pattern {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    broadcast = create_broadcast(title, args.privacy)
+    broadcast_id = str(broadcast["id"])
+    bind_broadcast(broadcast_id, stream_id)
+    write_state({"last_broadcast_id": broadcast_id, "last_stream_id": stream_id, "title": title})
+    log(f"created and bound broadcast id={broadcast_id} stream_id={stream_id}")
+
+    child = subprocess.Popen(
+        [os.environ.get("YTA_TEST_PATTERN", "youtube-autoencoder-test-pattern"), str(args.duration)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    selector = selectors.DefaultSelector()
+    if child.stdout is not None:
+        selector.register(child.stdout, selectors.EVENT_READ)
+    try:
+        wait_stream_active(stream_id, args.wait_stream_active)
+        transitioned = transition(broadcast_id, "testing")
+        log(f"transitioned broadcast to testing status={(transitioned.get('status') or {}).get('lifeCycleStatus')}")
+        time.sleep(args.testing_delay)
+        transitioned = transition(broadcast_id, "live")
+        log(f"transitioned broadcast to live status={(transitioned.get('status') or {}).get('lifeCycleStatus')}")
+        while child.poll() is None and not stopping:
+            for key, _mask in selector.select(timeout=1):
+                line = key.fileobj.readline()
+                if line:
+                    print(line.rstrip(), flush=True)
+        rc = child.wait(timeout=20)
+        if args.complete:
+            try:
+                transition(broadcast_id, "complete")
+                log("completed YouTube broadcast")
+            except Exception as exc:  # noqa: BLE001
+                log(f"could not complete broadcast: {exc}")
+        return rc
+    finally:
+        if child and child.poll() is None:
+            log("stopping test pattern after interrupted API test")
+            child.send_signal(signal.SIGINT)
+            try:
+                child.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                log("test pattern did not stop cleanly; killing")
+                child.kill()
+                child.wait(timeout=10)
+        selector.close()
+        child = None
+
+
+def complete(args: argparse.Namespace) -> int:
+    broadcast_id = args.broadcast_id or str(read_json(STATE_FILE).get("last_broadcast_id") or "")
+    if not broadcast_id:
+        raise ValueError("no broadcast id provided and no previous state file found")
+    result = transition(broadcast_id, "complete")
+    print(json.dumps({"id": result.get("id"), "status": result.get("status")}, indent=2, sort_keys=True))
+    return 0
+
+
+def transition_command(args: argparse.Namespace) -> int:
+    broadcast_id = args.broadcast_id or str(read_json(STATE_FILE).get("last_broadcast_id") or "")
+    if not broadcast_id:
+        raise ValueError("no broadcast id provided and no previous state file found")
+    result = transition(broadcast_id, args.status)
+    print(json.dumps({"id": result.get("id"), "status": result.get("status")}, indent=2, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, stop_child)
+    signal.signal(signal.SIGINT, stop_child)
+    parser = argparse.ArgumentParser(description="Control YouTube Live for YouTube AutoEncoder")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    auth_p = sub.add_parser("authorize", help="Run OAuth device authorization")
+    auth_p.set_defaults(func=authorize)
+
+    status_p = sub.add_parser("status", help="Show the liveStream matching OBS service.json")
+    status_p.set_defaults(func=status)
+
+    prepare_p = sub.add_parser("prepare-broadcast", help="Create and bind a broadcast for the reusable stream")
+    prepare_p.add_argument("--privacy", choices=["public", "unlisted", "private"], default=os.environ.get("YTA_YOUTUBE_PRIVACY", "unlisted"))
+    prepare_p.add_argument("--title")
+    prepare_p.add_argument("--title-prefix", default=os.environ.get("YTA_YOUTUBE_TITLE_PREFIX", "AutoEncoder Live"))
+    prepare_p.add_argument("--create-stream", action="store_true", help="Create a reusable stream if OBS key is not found")
+    prepare_p.set_defaults(func=prepare_broadcast)
+
+    wait_p = sub.add_parser("wait-stream-active", help="Wait until a liveStream reports active ingest")
+    wait_p.add_argument("stream_id", nargs="?")
+    wait_p.add_argument("--timeout", type=int, default=int(os.environ.get("YTA_YOUTUBE_WAIT_ACTIVE_SEC", "180")))
+    wait_p.set_defaults(func=wait_active_command)
+
+    test_p = sub.add_parser("run-visible-test", help="Create/bind/transition a visible test-pattern broadcast")
+    test_p.add_argument("--duration", type=int, default=900)
+    test_p.add_argument("--wait-stream-active", type=int, default=120)
+    test_p.add_argument("--testing-delay", type=int, default=8)
+    test_p.add_argument("--privacy", choices=["public", "unlisted", "private"], default=os.environ.get("YTA_YOUTUBE_PRIVACY", "unlisted"))
+    test_p.add_argument("--title")
+    test_p.add_argument("--create-stream", action="store_true", help="Create a reusable stream if OBS key is not found")
+    test_p.add_argument("--no-complete", dest="complete", action="store_false", help="Leave broadcast live after the test exits")
+    test_p.set_defaults(func=run_visible_test, complete=True)
+
+    complete_p = sub.add_parser("complete", help="Complete the last or specified broadcast")
+    complete_p.add_argument("broadcast_id", nargs="?")
+    complete_p.set_defaults(func=complete)
+
+    transition_p = sub.add_parser("transition", help="Transition the last or specified broadcast")
+    transition_p.add_argument("status", choices=["testing", "live", "complete"])
+    transition_p.add_argument("broadcast_id", nargs="?")
+    transition_p.set_defaults(func=transition_command)
+
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
