@@ -783,10 +783,7 @@ def stream_status(stream_id: str | None = None) -> dict[str, Any]:
     }
 
 
-def broadcast_status(broadcast_id: str) -> dict[str, Any]:
-    broadcast = broadcast_by_id(broadcast_id)
-    if broadcast is None:
-        raise ReconciliationError(f"liveBroadcast not found: {broadcast_id}")
+def broadcast_status_payload(broadcast: dict[str, Any]) -> dict[str, Any]:
     return {
         "broadcast_id": broadcast.get("id"),
         "title": (broadcast.get("snippet") or {}).get("title"),
@@ -795,6 +792,13 @@ def broadcast_status(broadcast_id: str) -> dict[str, Any]:
         "privacy": broadcast_privacy(broadcast),
         "bound_stream_id": broadcast_bound_stream(broadcast),
     }
+
+
+def broadcast_status(broadcast_id: str) -> dict[str, Any]:
+    broadcast = broadcast_by_id(broadcast_id)
+    if broadcast is None:
+        raise ReconciliationError(f"liveBroadcast not found: {broadcast_id}")
+    return broadcast_status_payload(broadcast)
 
 
 def set_broadcast_privacy(broadcast_id: str, privacy: str) -> dict[str, Any]:
@@ -956,7 +960,7 @@ def set_privacy_command(args: argparse.Namespace) -> int:
             }
         )
         write_state(state)
-    print(json.dumps(broadcast_status(broadcast_id), indent=2, sort_keys=True))
+    print(json.dumps(broadcast_status_payload(result), indent=2, sort_keys=True))
     return 0
 
 

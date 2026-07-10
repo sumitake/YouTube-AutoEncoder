@@ -500,6 +500,34 @@ def test_set_broadcast_privacy_preserves_required_fields_and_verifies_readback(l
     ]
 
 
+def test_set_privacy_command_reuses_verified_readback(load_script, monkeypatch, tmp_path, capsys):
+    api = load_script("youtube-autoencoder-api", "yta_api_privacy_command")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    public = managed_broadcast(api, "broadcast-1", "live")
+    public["status"]["privacyStatus"] = "public"
+    api.write_state(
+        {
+            "schema_version": 2,
+            "instance_id": "encoder-1",
+            "stream_id": "stream-1",
+            "broadcast_id": "broadcast-1",
+        }
+    )
+    monkeypatch.setattr(api, "set_broadcast_privacy", lambda _broadcast_id, _privacy: public)
+    monkeypatch.setattr(
+        api,
+        "broadcast_status",
+        lambda _broadcast_id: pytest.fail("third broadcast read called"),
+    )
+
+    args = argparse.Namespace(broadcast_id="broadcast-1", privacy="public")
+
+    assert api.set_privacy_command(args) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["broadcast_id"] == "broadcast-1"
+    assert output["privacy"] == "public"
+
+
 def test_retry_state_updates_preserve_broadcast_identity(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_retry_state")
     configure_reconciliation(api, monkeypatch, tmp_path)

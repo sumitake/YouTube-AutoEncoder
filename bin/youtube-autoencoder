@@ -17,6 +17,7 @@ import selectors
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -39,6 +40,7 @@ URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]
 RTMP_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>rtmps?://[^\s/]+/)[^\s]+")
 YOUTUBE_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>https?://[^\s/]*(?:youtube|google)[^\s/]*/)[^\s]+")
 PROGRESS_LINE_RE = re.compile(r"^[A-Za-z0-9_]+=.*$")
+RTSP_OPTION_CACHE: dict[tuple[str, str], bool] = {}
 SUPERVISOR_LOCK_FILE = pathlib.Path(
     os.environ.get("YTA_SUPERVISOR_LOCK_FILE", HOME / ".config/youtube-autoencoder/supervisor.lock")
 ).expanduser()
@@ -300,6 +302,9 @@ def stream_config() -> tuple[str, str]:
 
 
 def binary_supports_rtsp_option(binary: str, option: str) -> bool:
+    cache_key = (binary, option)
+    if cache_key in RTSP_OPTION_CACHE:
+        return RTSP_OPTION_CACHE[cache_key]
     try:
         result = subprocess.run(
             [binary, "-hide_banner", "-h", "demuxer=rtsp"],
@@ -312,7 +317,9 @@ def binary_supports_rtsp_option(binary: str, option: str) -> bool:
         log(f"could not inspect {pathlib.Path(binary).name} RTSP options: {exc}")
         return False
     output = "\n".join((result.stdout or "", result.stderr or ""))
-    return any(line.lstrip().startswith(f"-{option} ") for line in output.splitlines())
+    supported = any(line.lstrip().startswith(f"-{option} ") for line in output.splitlines())
+    RTSP_OPTION_CACHE[cache_key] = supported
+    return supported
 
 
 def ffmpeg_supports_rtsp_option(option: str) -> bool:
@@ -575,38 +582,46 @@ def api_command_while_streaming(
     timeout: int,
 ) -> dict[str, Any]:
     cmd = [env("YTA_YOUTUBE_API", "youtube-autoencoder-api"), *args]
-    try:
-        api_process = subprocess.Popen(
-            cmd,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except OSError as exc:
-        raise ApiCommandError(
-            returncode=-1,
-            payload={"message": f"could not start YouTube API helper: {exc}", "retry_class": "fatal"},
-        ) from exc
-    deadline = time.monotonic() + timeout
-    try:
-        while api_process.poll() is None:
-            remaining = max(0.0, deadline - time.monotonic())
-            drain_ffmpeg_output(runtime, timeout=min(0.5, remaining))
+    with (
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout_file,
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file,
+    ):
+        try:
+            api_process = subprocess.Popen(
+                cmd,
+                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+        except OSError as exc:
+            raise ApiCommandError(
+                returncode=-1,
+                payload={"message": f"could not start YouTube API helper: {exc}", "retry_class": "fatal"},
+            ) from exc
+        deadline = time.monotonic() + timeout
+        try:
+            while api_process.poll() is None:
+                remaining = max(0.0, deadline - time.monotonic())
+                drain_ffmpeg_output(runtime, timeout=min(0.5, remaining))
+                ensure_encoder_running(runtime)
+                if time.monotonic() >= deadline:
+                    raise ApiCommandError(
+                        returncode=-1,
+                        payload={
+                            "message": f"YouTube API command timed out after {timeout}s",
+                            "retry_class": "api",
+                        },
+                    )
+            drain_ffmpeg_output(runtime, timeout=0.0)
             ensure_encoder_running(runtime)
-            if time.monotonic() >= deadline:
-                raise ApiCommandError(
-                    returncode=-1,
-                    payload={
-                        "message": f"YouTube API command timed out after {timeout}s",
-                        "retry_class": "api",
-                    },
-                )
-        drain_ffmpeg_output(runtime, timeout=0.0)
-        ensure_encoder_running(runtime)
-        stdout, stderr = api_process.communicate()
-    except BaseException:
-        stop_process(api_process)
-        raise
+            api_process.wait()
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read()
+            stderr = stderr_file.read()
+        except BaseException:
+            stop_process(api_process)
+            raise
     return parse_api_result(api_process.returncode, stdout, stderr)
 
 

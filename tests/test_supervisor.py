@@ -137,6 +137,26 @@ def test_ffmpeg_capability_probe_reads_rtsp_demuxer_options(load_script, monkeyp
     assert supervisor.ffmpeg_supports_rtsp_option("rw_timeout") is False
 
 
+def test_ffmpeg_capability_probe_is_cached_per_binary_and_option(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_supervisor_capability_cache")
+    calls = []
+
+    def inspect(*_args, **_kwargs):
+        calls.append(True)
+        return subprocess.CompletedProcess(
+            args=["ffmpeg"],
+            returncode=0,
+            stdout="  -timeout <int64> set timeout\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(supervisor.subprocess, "run", inspect)
+
+    assert supervisor.ffmpeg_supports_rtsp_option("timeout") is True
+    assert supervisor.ffmpeg_supports_rtsp_option("timeout") is True
+    assert len(calls) == 1
+
+
 def test_ffmpeg_capability_probe_fails_closed_on_timeout(load_script, monkeypatch):
     supervisor = load_script("youtube-autoencoder", "yta_supervisor_capability_timeout")
 
@@ -256,7 +276,13 @@ def test_api_wait_parses_structured_error(load_script, monkeypatch):
         "retry_class": "quota",
     }
     api_process = FakeApiProcess(returncode=75, stderr=json.dumps(payload))
-    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_args, **_kwargs: api_process)
+
+    def launch(*_args, **kwargs):
+        kwargs["stderr"].write(api_process.stderr_text)
+        kwargs["stderr"].flush()
+        return api_process
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", launch)
     runtime = supervisor.StreamRuntime(
         process=FakeFfmpegProcess(returncode=None),
         selector=FakeSelector(),
@@ -268,6 +294,34 @@ def test_api_wait_parses_structured_error(load_script, monkeypatch):
 
     assert raised.value.retry_class == "quota"
     assert raised.value.retry_after == 120
+
+
+def test_api_wait_spools_large_helper_output_without_pipe_backpressure(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_supervisor_api_spool")
+    payload = {"stream_id": "stream-1", "padding": "x" * 100_000}
+    api_process = FakeApiProcess(returncode=0)
+
+    def launch(*_args, **kwargs):
+        assert kwargs["stdout"] != subprocess.PIPE
+        assert kwargs["stderr"] != subprocess.PIPE
+        kwargs["stdout"].write(json.dumps(payload))
+        kwargs["stdout"].flush()
+        return api_process
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", launch)
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+
+    result = supervisor.api_command_while_streaming(["stream-status"], runtime, timeout=5)
+
+    assert result == payload
 
 
 def test_api_wait_wraps_helper_launch_failure(load_script, monkeypatch):
