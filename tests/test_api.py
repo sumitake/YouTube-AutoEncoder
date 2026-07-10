@@ -149,6 +149,72 @@ def test_http_json_exposes_youtube_error_reason(load_script, monkeypatch):
     }
 
 
+def test_http_json_preserves_oauth_device_error_reason(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_oauth_error")
+    body = json.dumps(
+        {
+            "error": "authorization_pending",
+            "error_description": "The user has not completed authorization.",
+        }
+    ).encode()
+
+    def fail_request(_request, timeout):
+        assert timeout == 30
+        raise urllib.error.HTTPError(
+            "https://oauth2.googleapis.com/token",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", fail_request)
+
+    with pytest.raises(api.YouTubeApiError) as raised:
+        api.http_json("POST", "https://oauth2.googleapis.com/token", form={"device_code": "code"})
+
+    assert raised.value.reasons == ("authorization_pending",)
+    assert str(raised.value) == "The user has not completed authorization."
+
+
+def test_authorize_retries_pending_device_flow(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_authorize_pending")
+    calls = []
+    responses = iter(
+        [
+            {
+                "verification_url": "https://example.test/device",
+                "user_code": "ABCD-EFGH",
+                "device_code": "device-code",
+                "interval": 1,
+                "expires_in": 600,
+            },
+            api.YouTubeApiError(
+                status=400,
+                reasons=("authorization_pending",),
+                message="authorization_pending",
+            ),
+            {"access_token": "access", "refresh_token": "refresh", "expires_in": 3600},
+        ]
+    )
+
+    def fake_http(*_args, **_kwargs):
+        calls.append(True)
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(api, "TOKEN_FILE", tmp_path / "youtube-token.json")
+    monkeypatch.setattr(api, "client_config", lambda: {"client_id": "id", "client_secret": "secret"})
+    monkeypatch.setattr(api, "http_json", fake_http)
+    monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
+
+    assert api.authorize(argparse.Namespace()) == 0
+    assert len(calls) == 3
+    assert json.loads(api.TOKEN_FILE.read_text(encoding="utf-8"))["refresh_token"] == "refresh"
+
+
 def test_corrupt_state_is_quarantined(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_corrupt_state")
     state = tmp_path / "youtube-live-state.json"

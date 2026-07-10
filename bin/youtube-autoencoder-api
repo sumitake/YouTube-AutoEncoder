@@ -237,11 +237,18 @@ def http_json(
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             parsed = {"error": raw}
-        details = parsed.get("error") if isinstance(parsed, dict) else None
-        details = details if isinstance(details, dict) else {}
-        errors = details.get("errors") or []
-        reasons = tuple(str(item.get("reason")) for item in errors if isinstance(item, dict) and item.get("reason"))
-        message = str(details.get("message") or exc.reason or "YouTube API request failed")
+        parsed_object = parsed if isinstance(parsed, dict) else {}
+        error_value = parsed_object.get("error")
+        if isinstance(error_value, dict):
+            errors = error_value.get("errors") or []
+            reasons = tuple(str(item.get("reason")) for item in errors if isinstance(item, dict) and item.get("reason"))
+            message = str(error_value.get("message") or exc.reason or "YouTube API request failed")
+        elif isinstance(error_value, str):
+            reasons = (error_value,)
+            message = str(parsed_object.get("error_description") or error_value)
+        else:
+            reasons = ()
+            message = str(exc.reason or "YouTube API request failed")
         retry_after = None
         retry_after_value = exc.headers.get("Retry-After") if exc.headers else None
         if retry_after_value:
@@ -295,11 +302,10 @@ def authorize(_args: argparse.Namespace) -> int:
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 },
             )
-        except RuntimeError as exc:
-            text = str(exc)
-            if "authorization_pending" in text:
+        except YouTubeApiError as exc:
+            if "authorization_pending" in exc.reasons:
                 continue
-            if "slow_down" in text:
+            if "slow_down" in exc.reasons:
                 interval += 5
                 continue
             raise

@@ -616,6 +616,16 @@ def test_managed_lifecycle_waits_for_ingest_before_reconcile(load_script, monkey
     assert state["privacy"] == "public"
 
 
+def test_legacy_public_privacy_never_changes_staging_default(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_staging_legacy_privacy")
+    monkeypatch.delenv("YTA_YOUTUBE_STAGING_PRIVACY", raising=False)
+    monkeypatch.setenv("YTA_YOUTUBE_PRIVACY", "public")
+
+    args = supervisor.reconcile_command_args()
+
+    assert args[args.index("--privacy") + 1] == "unlisted"
+
+
 def test_unattended_supervisor_has_no_completion_helper(load_script):
     supervisor = load_script("youtube-autoencoder", "yta_no_auto_complete")
 

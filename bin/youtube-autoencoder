@@ -691,7 +691,7 @@ def reconcile_command_args() -> list[str]:
         "reconcile-broadcast",
         "--allow-create",
         "--privacy",
-        env("YTA_YOUTUBE_STAGING_PRIVACY", env("YTA_YOUTUBE_PRIVACY", "unlisted")),
+        env("YTA_YOUTUBE_STAGING_PRIVACY", "unlisted"),
         "--title-prefix",
         env("YTA_YOUTUBE_TITLE_PREFIX", "AutoEncoder Live"),
     ]
