@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import urllib.error
 import uuid
 
@@ -80,6 +81,24 @@ def test_write_secret_json_fsyncs_file_and_parent(load_script, monkeypatch, tmp_
     assert json.loads(path.read_text(encoding="utf-8")) == {"refresh_token": "refresh-token"}
     assert len(fsync_calls) >= 2
     assert not path.with_suffix(path.suffix + ".tmp").exists()
+
+
+def test_write_json_durable_creates_private_unique_temp(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_private_temp")
+    path = tmp_path / "youtube-token.json"
+    real_dump = api.json.dump
+    observed_modes = []
+
+    def inspect_mode(data, handle, *args, **kwargs):
+        observed_modes.append(os.fstat(handle.fileno()).st_mode & 0o777)
+        return real_dump(data, handle, *args, **kwargs)
+
+    monkeypatch.setattr(api.json, "dump", inspect_mode)
+
+    api.write_json_durable(path, {"refresh_token": "refresh-token"})
+
+    assert observed_modes == [0o600]
+    assert list(tmp_path.glob(".youtube-token.json.*.tmp")) == []
 
 
 def test_http_json_exposes_youtube_error_reason(load_script, monkeypatch):
@@ -173,6 +192,17 @@ def test_cli_main_emits_structured_retryable_error(load_script, monkeypatch, cap
     assert payload["reasons"] == ["backendError"]
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["concurrentBroadcastsExceedLimit", "sharedIngestionBroadcastsExceedLimit"],
+)
+def test_concurrent_broadcast_limits_use_quota_backoff(load_script, reason):
+    api = load_script("youtube-autoencoder-api", f"yta_api_rate_{reason}")
+    error = api.YouTubeApiError(status=403, reasons=(reason,), message="broadcast limit")
+
+    assert error.retry_class == "quota"
+
+
 def test_create_broadcast_payload(load_script, monkeypatch):
     api = load_script("youtube-autoencoder-api", "yta_api_broadcast_payload")
     calls = []
@@ -206,9 +236,7 @@ def test_description_contains_exact_instance_and_generation_markers(load_script)
 
 
 @pytest.mark.parametrize("lifecycle", ["created", "ready", "testStarting", "testing", "liveStarting", "live"])
-def test_reconcile_reuses_nonterminal_broadcast_without_insert(
-    load_script, monkeypatch, tmp_path, lifecycle
-):
+def test_reconcile_reuses_nonterminal_broadcast_without_insert(load_script, monkeypatch, tmp_path, lifecycle):
     api = load_script("youtube-autoencoder-api", f"yta_api_reuse_{lifecycle}")
     configure_reconciliation(api, monkeypatch, tmp_path)
     api.write_state(
@@ -465,9 +493,7 @@ def test_set_broadcast_privacy_preserves_required_fields_and_verifies_readback(l
             "body": {
                 "id": "broadcast-1",
                 "snippet": {"scheduledStartTime": "2026-07-10T21:00:00Z"},
-                "contentDetails": {
-                    "monitorStream": {"enableMonitorStream": True, "broadcastStreamDelayMs": 0}
-                },
+                "contentDetails": {"monitorStream": {"enableMonitorStream": True, "broadcastStreamDelayMs": 0}},
                 "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
             },
         }
@@ -550,6 +576,50 @@ def test_transition_command_serializes_mutation(load_script, monkeypatch, capsys
     assert api.transition_command(args) == 0
     assert events == [("lock", 7.0), ("unlock", 7.0)]
     assert json.loads(capsys.readouterr().out)["status"]["lifeCycleStatus"] == "live"
+
+
+def test_complete_requires_confirmed_live_broadcast(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_complete_live")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    broadcast = managed_broadcast(api, "broadcast-1", "live")
+    transitions = []
+    monkeypatch.setattr(api, "broadcast_by_id", lambda _broadcast_id: broadcast)
+    monkeypatch.setattr(
+        api,
+        "transition",
+        lambda broadcast_id, status: transitions.append((broadcast_id, status))
+        or {"id": broadcast_id, "status": {"lifeCycleStatus": "complete"}},
+    )
+
+    args = argparse.Namespace(broadcast_id="broadcast-1")
+
+    assert api.complete(args) == 0
+    assert transitions == [("broadcast-1", "complete")]
+
+
+def test_complete_refuses_nonlive_broadcast(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_complete_nonlive")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    broadcast = managed_broadcast(api, "broadcast-1", "ready")
+    monkeypatch.setattr(api, "broadcast_by_id", lambda _broadcast_id: broadcast)
+    monkeypatch.setattr(api, "transition", lambda *_args: pytest.fail("transition called"))
+
+    with pytest.raises(api.ReconciliationError, match="not confirmed live"):
+        api.complete(argparse.Namespace(broadcast_id="broadcast-1"))
+
+
+def test_generic_transition_parser_cannot_complete_broadcast(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_no_generic_complete")
+    monkeypatch.setattr(
+        api.sys,
+        "argv",
+        ["youtube-autoencoder-api", "transition", "complete", "broadcast-1"],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        api.main()
+
+    assert raised.value.code == 2
 
 
 def test_state_command_outputs_non_secret_recovery_state(load_script, monkeypatch, capsys):

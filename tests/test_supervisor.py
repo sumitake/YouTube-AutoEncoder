@@ -310,6 +310,48 @@ def test_lifecycle_action_matrix(load_script, lifecycle, expected_action):
     assert supervisor.lifecycle_action(lifecycle) == expected_action
 
 
+def test_created_lifecycle_waits_for_ready_before_transition(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_lifecycle_created_poll")
+    events = []
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+
+    monkeypatch.setattr(supervisor, "wait_with_runtime", lambda _runtime, _duration: events.append("wait"))
+    monkeypatch.setattr(
+        supervisor,
+        "current_observation",
+        lambda _runtime, _state: events.append("observe")
+        or {
+            "stream_status": "active",
+            "health": "good",
+            "lifecycle": "live",
+            "privacy": "unlisted",
+            "encoder_alive": True,
+            "media_fresh": True,
+        },
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "api_command_while_streaming",
+        lambda *_args, **_kwargs: pytest.fail("created broadcast was transitioned before ready"),
+    )
+
+    state = supervisor.reconcile_lifecycle(
+        runtime,
+        {"stream_id": "stream-1", "broadcast_id": "broadcast-1", "lifecycle": "created"},
+    )
+
+    assert state["lifecycle"] == "live"
+    assert events == ["wait", "observe"]
+
+
 @pytest.mark.parametrize(
     ("retry_class", "first", "maximum"),
     [

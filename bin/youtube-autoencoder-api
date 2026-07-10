@@ -17,6 +17,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -26,7 +27,9 @@ from typing import Any
 
 HOME = pathlib.Path.home()
 BASE_DIR = pathlib.Path(os.environ.get("YTA_CONFIG_DIR", HOME / ".config/youtube-autoencoder")).expanduser()
-CLIENT_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_CLIENT_FILE", BASE_DIR / "google-oauth-client.json")).expanduser()
+CLIENT_FILE = pathlib.Path(
+    os.environ.get("YTA_YOUTUBE_CLIENT_FILE", BASE_DIR / "google-oauth-client.json")
+).expanduser()
 TOKEN_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_TOKEN_FILE", BASE_DIR / "youtube-token.json")).expanduser()
 STATE_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_STATE_FILE", BASE_DIR / "youtube-live-state.json")).expanduser()
 LOCK_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_LOCK_FILE", BASE_DIR / "youtube-live-state.lock")).expanduser()
@@ -40,9 +43,11 @@ API_BASE = "https://www.googleapis.com/youtube/v3"
 child: subprocess.Popen[Any] | None = None
 stopping = False
 RATE_LIMIT_REASONS = {
+    "concurrentBroadcastsExceedLimit",
     "dailyLimitExceeded",
     "quotaExceeded",
     "rateLimitExceeded",
+    "sharedIngestionBroadcastsExceedLimit",
     "userRateLimitExceeded",
     "userRequestsExceedRateLimit",
 }
@@ -103,16 +108,28 @@ def fsync_directory(path: pathlib.Path) -> None:
 
 def write_json_durable(path: pathlib.Path, data: dict[str, Any], mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(tmp, mode)
-    tmp.replace(path)
-    os.chmod(path, mode)
-    fsync_directory(path.parent)
+    raw_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    tmp = pathlib.Path(tmp_name)
+    try:
+        os.fchmod(raw_fd, mode)
+        file_handle = os.fdopen(raw_fd, "w", encoding="utf-8")
+        raw_fd = -1
+        with file_handle as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+        os.chmod(path, mode)
+        fsync_directory(path.parent)
+    finally:
+        if raw_fd >= 0:
+            os.close(raw_fd)
+        tmp.unlink(missing_ok=True)
 
 
 def write_secret_json(path: pathlib.Path, data: dict[str, Any]) -> None:
@@ -223,11 +240,7 @@ def http_json(
         details = parsed.get("error") if isinstance(parsed, dict) else None
         details = details if isinstance(details, dict) else {}
         errors = details.get("errors") or []
-        reasons = tuple(
-            str(item.get("reason"))
-            for item in errors
-            if isinstance(item, dict) and item.get("reason")
-        )
+        reasons = tuple(str(item.get("reason")) for item in errors if isinstance(item, dict) and item.get("reason"))
         message = str(details.get("message") or exc.reason or "YouTube API request failed")
         retry_after = None
         retry_after_value = exc.headers.get("Retry-After") if exc.headers else None
@@ -350,7 +363,7 @@ def list_streams() -> list[dict[str, Any]]:
 def find_obs_stream() -> dict[str, Any]:
     stream_name = obs_stream_name()
     for stream in list_streams():
-        ingestion = ((stream.get("cdn") or {}).get("ingestionInfo") or {})
+        ingestion = (stream.get("cdn") or {}).get("ingestionInfo") or {}
         if ingestion.get("streamName") == stream_name:
             return stream
     raise LookupError("no YouTube liveStream matched the configured OBS stream key")
@@ -373,7 +386,7 @@ def create_stream() -> dict[str, Any]:
 
 
 def save_stream_to_obs(stream: dict[str, Any]) -> None:
-    ingestion = ((stream.get("cdn") or {}).get("ingestionInfo") or {})
+    ingestion = (stream.get("cdn") or {}).get("ingestionInfo") or {}
     stream_name = ingestion.get("streamName")
     server = ingestion.get("rtmpsIngestionAddress") or ingestion.get("ingestionAddress")
     if not stream_name or not server:
@@ -430,13 +443,9 @@ def has_marker(broadcast: dict[str, Any], marker: str) -> bool:
 
 def broadcast_generation(broadcast: dict[str, Any]) -> str:
     description = str((broadcast.get("snippet") or {}).get("description") or "")
-    marker_pattern = re.compile(
-        rf"^\[{re.escape(GENERATION_MARKER_PREFIX)}:([A-Za-z0-9._-]+)\]$"
-    )
+    marker_pattern = re.compile(rf"^\[{re.escape(GENERATION_MARKER_PREFIX)}:([A-Za-z0-9._-]+)\]$")
     generations = [
-        match.group(1)
-        for line in description.splitlines()
-        if (match := marker_pattern.fullmatch(line)) is not None
+        match.group(1) for line in description.splitlines() if (match := marker_pattern.fullmatch(line)) is not None
     ]
     if len(generations) != 1:
         raise ReconciliationError("managed broadcast must contain exactly one generation marker")
@@ -539,9 +548,7 @@ def lifecycle_state(
     return state
 
 
-def validate_candidate(
-    broadcast: dict[str, Any], *, instance: str, generation: str | None, stream_id: str
-) -> None:
+def validate_candidate(broadcast: dict[str, Any], *, instance: str, generation: str | None, stream_id: str) -> None:
     lifecycle = broadcast_lifecycle(broadcast)
     if lifecycle not in KNOWN_LIFECYCLE_STATES:
         raise ReconciliationError(f"unknown YouTube broadcast lifecycle: {lifecycle or '<empty>'}")
@@ -578,9 +585,7 @@ def choose_candidate(
     return candidate
 
 
-def reconcile_broadcast(
-    *, stream_id: str, title: str, staging_privacy: str, allow_create: bool
-) -> dict[str, Any]:
+def reconcile_broadcast(*, stream_id: str, title: str, staging_privacy: str, allow_create: bool) -> dict[str, Any]:
     with mutation_lock(timeout=lock_timeout()):
         instance = instance_id()
         state = read_state()
@@ -650,8 +655,7 @@ def reconcile_broadcast(
                 stream_status_value = str((stream.get("status") or {}).get("streamStatus") or "")
                 if stream_status_value != "active":
                     raise ReconciliationError(
-                        "YouTube ingest stopped before broadcast creation; "
-                        f"got {stream_status_value or 'unknown'}"
+                        f"YouTube ingest stopped before broadcast creation; got {stream_status_value or 'unknown'}"
                     )
                 broadcast = create_broadcast(
                     title,
@@ -925,9 +929,7 @@ def stream_status_command(args: argparse.Namespace) -> int:
 
 def broadcast_status_command(args: argparse.Namespace) -> int:
     state = read_state()
-    broadcast_id = args.broadcast_id or str(
-        state.get("broadcast_id") or state.get("last_broadcast_id") or ""
-    )
+    broadcast_id = args.broadcast_id or str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
     if not broadcast_id:
         raise ValueError("no broadcast id provided and no previous state file found")
     print(json.dumps(broadcast_status(broadcast_id), indent=2, sort_keys=True))
@@ -937,9 +939,7 @@ def broadcast_status_command(args: argparse.Namespace) -> int:
 def set_privacy_command(args: argparse.Namespace) -> int:
     with mutation_lock(timeout=lock_timeout()):
         state = read_state()
-        broadcast_id = args.broadcast_id or str(
-            state.get("broadcast_id") or state.get("last_broadcast_id") or ""
-        )
+        broadcast_id = args.broadcast_id or str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
         if not broadcast_id:
             raise ValueError("no broadcast id provided and no previous state file found")
         result = set_broadcast_privacy(broadcast_id, args.privacy)
@@ -1050,11 +1050,15 @@ def run_visible_test(args: argparse.Namespace) -> int:
 def complete(args: argparse.Namespace) -> int:
     with mutation_lock(timeout=lock_timeout()):
         state = read_state()
-        broadcast_id = args.broadcast_id or str(
-            state.get("broadcast_id") or state.get("last_broadcast_id") or ""
-        )
+        broadcast_id = args.broadcast_id or str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
         if not broadcast_id:
             raise ValueError("no broadcast id provided and no previous state file found")
+        current = broadcast_by_id(broadcast_id)
+        lifecycle = broadcast_lifecycle(current or {})
+        if current is None or lifecycle != "live":
+            raise ReconciliationError(
+                f"refusing completion because broadcast is not confirmed live: {lifecycle or 'missing'}"
+            )
         result = transition(broadcast_id, "complete")
     print(json.dumps({"id": result.get("id"), "status": result.get("status")}, indent=2, sort_keys=True))
     return 0
@@ -1063,9 +1067,7 @@ def complete(args: argparse.Namespace) -> int:
 def transition_command(args: argparse.Namespace) -> int:
     with mutation_lock(timeout=lock_timeout()):
         state = read_state()
-        broadcast_id = args.broadcast_id or str(
-            state.get("broadcast_id") or state.get("last_broadcast_id") or ""
-        )
+        broadcast_id = args.broadcast_id or str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
         if not broadcast_id:
             raise ValueError("no broadcast id provided and no previous state file found")
         result = transition(broadcast_id, args.status)
@@ -1097,10 +1099,16 @@ def main() -> int:
     broadcast_status_p.set_defaults(func=broadcast_status_command)
 
     prepare_p = sub.add_parser("prepare-broadcast", help="Create and bind a broadcast for the reusable stream")
-    prepare_p.add_argument("--privacy", choices=["public", "unlisted", "private"], default=os.environ.get("YTA_YOUTUBE_PRIVACY", "unlisted"))
+    prepare_p.add_argument(
+        "--privacy",
+        choices=["public", "unlisted", "private"],
+        default=os.environ.get("YTA_YOUTUBE_PRIVACY", "unlisted"),
+    )
     prepare_p.add_argument("--title")
     prepare_p.add_argument("--title-prefix", default=os.environ.get("YTA_YOUTUBE_TITLE_PREFIX", "AutoEncoder Live"))
-    prepare_p.add_argument("--create-stream", action="store_true", help="Create a reusable stream if OBS key is not found")
+    prepare_p.add_argument(
+        "--create-stream", action="store_true", help="Create a reusable stream if OBS key is not found"
+    )
     prepare_p.set_defaults(func=prepare_broadcast)
 
     reconcile_p = sub.add_parser(
@@ -1112,9 +1120,7 @@ def main() -> int:
         default=os.environ.get("YTA_YOUTUBE_PRIVACY", "unlisted"),
     )
     reconcile_p.add_argument("--title")
-    reconcile_p.add_argument(
-        "--title-prefix", default=os.environ.get("YTA_YOUTUBE_TITLE_PREFIX", "AutoEncoder Live")
-    )
+    reconcile_p.add_argument("--title-prefix", default=os.environ.get("YTA_YOUTUBE_TITLE_PREFIX", "AutoEncoder Live"))
     reconcile_p.add_argument(
         "--create-stream", action="store_true", help="Create a reusable stream if OBS key is not found"
     )
@@ -1134,7 +1140,11 @@ def main() -> int:
     test_p.add_argument("--duration", type=int, default=900)
     test_p.add_argument("--wait-stream-active", type=int, default=120)
     test_p.add_argument("--testing-delay", type=int, default=8)
-    test_p.add_argument("--privacy", choices=["public", "unlisted", "private"], default=os.environ.get("YTA_YOUTUBE_PRIVACY", "unlisted"))
+    test_p.add_argument(
+        "--privacy",
+        choices=["public", "unlisted", "private"],
+        default=os.environ.get("YTA_YOUTUBE_PRIVACY", "unlisted"),
+    )
     test_p.add_argument("--title")
     test_p.add_argument("--create-stream", action="store_true", help="Create a reusable stream if OBS key is not found")
     test_p.add_argument(
@@ -1150,7 +1160,7 @@ def main() -> int:
     complete_p.set_defaults(func=complete)
 
     transition_p = sub.add_parser("transition", help="Transition the last or specified broadcast")
-    transition_p.add_argument("status", choices=["testing", "live", "complete"])
+    transition_p.add_argument("status", choices=["testing", "live"])
     transition_p.add_argument("broadcast_id", nargs="?")
     transition_p.set_defaults(func=transition_command)
 

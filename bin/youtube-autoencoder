@@ -710,7 +710,7 @@ def reconcile_lifecycle(runtime: StreamRuntime, initial_state: dict[str, Any]) -
                     "retry_class": "api",
                 },
             )
-        if action == "poll":
+        if lifecycle == "created" or action == "poll":
             wait_with_runtime(runtime, poll_interval())
             observation = current_observation(runtime, state)
             state["lifecycle"] = observation.get("lifecycle")
