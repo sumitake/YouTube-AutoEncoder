@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import subprocess
 
@@ -267,3 +268,334 @@ def test_api_wait_parses_structured_error(load_script, monkeypatch):
 
     assert raised.value.retry_class == "quota"
     assert raised.value.retry_after == 120
+
+
+def test_api_wait_wraps_helper_launch_failure(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_supervisor_api_missing")
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError("missing helper")),
+    )
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+
+    with pytest.raises(supervisor.ApiCommandError) as raised:
+        supervisor.api_command_while_streaming(["stream-status"], runtime, timeout=5)
+
+    assert raised.value.retry_class == "fatal"
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "expected_action"),
+    [
+        ("created", "testing"),
+        ("ready", "testing"),
+        ("testStarting", "poll"),
+        ("testing", "live"),
+        ("liveStarting", "poll"),
+        ("live", "confirm"),
+    ],
+)
+def test_lifecycle_action_matrix(load_script, lifecycle, expected_action):
+    supervisor = load_script("youtube-autoencoder", f"yta_lifecycle_{lifecycle}")
+
+    assert supervisor.lifecycle_action(lifecycle) == expected_action
+
+
+@pytest.mark.parametrize(
+    ("retry_class", "first", "maximum"),
+    [
+        ("source", 10, 300),
+        ("api", 30, 900),
+        ("quota", 900, 21600),
+        ("ambiguous", 300, 3600),
+    ],
+)
+def test_retry_backoff_bases_and_caps(load_script, retry_class, first, maximum):
+    supervisor = load_script("youtube-autoencoder", f"yta_backoff_{retry_class}")
+
+    assert supervisor.retry_delay(retry_class, attempt=1, jitter=0.0) == first
+    assert supervisor.retry_delay(retry_class, attempt=20, jitter=0.0) == maximum
+
+
+def test_retry_backoff_honors_longer_retry_after(load_script):
+    supervisor = load_script("youtube-autoencoder", "yta_backoff_retry_after")
+
+    assert supervisor.retry_delay("api", attempt=1, jitter=0.0, retry_after=120) == 120
+
+
+def test_quota_jitter_never_drops_below_initial_floor(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_backoff_quota_floor")
+    monkeypatch.setattr(supervisor.random, "uniform", lambda lower, _upper: lower)
+
+    assert supervisor.retry_delay("quota", attempt=1) == 900
+
+
+def test_persisted_future_cooldown_is_honored(load_script):
+    supervisor = load_script("youtube-autoencoder", "yta_backoff_persisted")
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.UTC)
+    state = {"retry_not_before": "2026-07-10T12:01:00Z"}
+
+    assert supervisor.retry_cooldown_remaining(state, now=now) == 60
+    assert supervisor.retry_cooldown_remaining(state, now=now + dt.timedelta(minutes=2)) == 0
+
+
+def test_classify_api_error_preserves_structured_retry_class(load_script):
+    supervisor = load_script("youtube-autoencoder", "yta_classify_api")
+    error = supervisor.ApiCommandError(
+        returncode=75,
+        payload={"message": "rate limited", "retry_class": "quota"},
+    )
+
+    assert supervisor.classify_api_error(error) == "quota"
+
+
+def test_publication_requires_two_healthy_live_observations(load_script):
+    supervisor = load_script("youtube-autoencoder", "yta_public_gate")
+    gate = supervisor.PublicationGate(required=2)
+    healthy = {"stream_status": "active", "health": "good", "lifecycle": "live"}
+
+    assert gate.observe(healthy) is False
+    assert gate.observe(healthy) is True
+
+
+@pytest.mark.parametrize(
+    "unhealthy",
+    [
+        {"stream_status": "inactive", "health": "good", "lifecycle": "live"},
+        {"stream_status": "active", "health": "bad", "lifecycle": "live"},
+        {"stream_status": "active", "health": "noData", "lifecycle": "live"},
+        {"stream_status": "active", "health": "good", "lifecycle": "testing"},
+        {
+            "stream_status": "active",
+            "health": "good",
+            "lifecycle": "live",
+            "encoder_alive": False,
+        },
+        {
+            "stream_status": "active",
+            "health": "good",
+            "lifecycle": "live",
+            "media_fresh": False,
+        },
+    ],
+)
+def test_publication_gate_resets_on_unhealthy_observation(load_script, unhealthy):
+    supervisor = load_script("youtube-autoencoder", "yta_public_gate_reset")
+    gate = supervisor.PublicationGate(required=2)
+    healthy = {"stream_status": "active", "health": "ok", "lifecycle": "live"}
+
+    assert gate.observe(healthy) is False
+    assert gate.observe(unhealthy) is False
+    assert gate.observe(healthy) is False
+
+
+def test_already_public_state_skips_youtube_health_polling(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_public_stable")
+    calls = []
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+
+    def capture(args, _runtime, timeout):
+        calls.append((args, timeout))
+        return {}
+
+    monkeypatch.setattr(supervisor, "api_command_while_streaming", capture)
+    monkeypatch.setattr(
+        supervisor,
+        "current_observation",
+        lambda *_args, **_kwargs: pytest.fail("stable public state should not poll YouTube"),
+    )
+    state = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "live",
+        "privacy": "public",
+    }
+
+    result = supervisor.publish_when_healthy(runtime, state)
+
+    assert result["privacy"] == "public"
+    assert [args[0] for args, _timeout in calls] == ["clear-retry"]
+
+
+def test_encoder_exit_after_live_never_promotes_privacy(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_public_child_exit")
+    calls = []
+    process = FakeFfmpegProcess(returncode=None)
+    runtime = supervisor.StreamRuntime(
+        process=process,
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+
+    def observe_once(_runtime, _state):
+        process.returncode = 1
+        return {"stream_status": "active", "health": "good", "lifecycle": "live"}
+
+    def capture(args, _runtime, timeout):
+        calls.append((args, timeout))
+        return {}
+
+    monkeypatch.setenv("YTA_YOUTUBE_POLL_INTERVAL_SEC", "0")
+    monkeypatch.setattr(supervisor, "current_observation", observe_once)
+    monkeypatch.setattr(supervisor, "api_command_while_streaming", capture)
+    state = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "live",
+        "privacy": "unlisted",
+    }
+
+    with pytest.raises(supervisor.EncoderStopped):
+        supervisor.publish_when_healthy(runtime, state)
+
+    assert not any(args[0] == "set-privacy" for args, _timeout in calls)
+
+
+def test_managed_lifecycle_waits_for_ingest_before_reconcile(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_lifecycle_order")
+    events = []
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+
+    def active(_runtime):
+        events.append("active")
+        return {"stream_id": "stream-1", "stream_status": "active"}
+
+    def command(args, _runtime, timeout):
+        events.append(args[0])
+        assert timeout == 120
+        assert args[0] == "reconcile-broadcast"
+        assert "--allow-create" in args
+        return {
+            "stream_id": "stream-1",
+            "broadcast_id": "broadcast-1",
+            "lifecycle": "ready",
+            "privacy": "unlisted",
+        }
+
+    def lifecycle(_runtime, state):
+        events.append("lifecycle")
+        return {**state, "lifecycle": "live"}
+
+    def publish(_runtime, state):
+        events.append("publish")
+        return {**state, "privacy": "public"}
+
+    monkeypatch.setattr(supervisor, "wait_for_active_stream", active)
+    monkeypatch.setattr(supervisor, "api_command_while_streaming", command)
+    monkeypatch.setattr(supervisor, "reconcile_lifecycle", lifecycle)
+    monkeypatch.setattr(supervisor, "publish_when_healthy", publish)
+
+    state = supervisor.manage_youtube_lifecycle(runtime)
+
+    assert events == ["active", "reconcile-broadcast", "lifecycle", "publish"]
+    assert state["privacy"] == "public"
+
+
+def test_unattended_supervisor_has_no_completion_helper(load_script):
+    supervisor = load_script("youtube-autoencoder", "yta_no_auto_complete")
+
+    assert not hasattr(supervisor, "complete_broadcast")
+
+
+def test_cached_public_stream_continues_during_api_quota_failure(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_public_api_fallback")
+    calls = []
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+    cached = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "live",
+        "privacy": "public",
+    }
+    failure = supervisor.ApiCommandError(
+        returncode=75,
+        payload={"message": "rate limited", "retry_class": "quota"},
+    )
+    monkeypatch.setattr(supervisor, "manage_youtube_lifecycle", lambda _runtime: (_ for _ in ()).throw(failure))
+    monkeypatch.setattr(supervisor, "retry_delay", lambda *_args, **_kwargs: 900)
+
+    def capture(args, _runtime, timeout):
+        calls.append((args, timeout))
+        return {}
+
+    monkeypatch.setattr(supervisor, "api_command_while_streaming", capture)
+
+    state = supervisor.manage_with_public_fallback(runtime, cached)
+
+    assert state == cached
+    assert calls[0][0][0:4] == ["set-retry", "quota", "1", calls[0][0][3]]
+    assert calls[0][1] == 30
+
+
+def test_prepublic_api_failure_does_not_enter_public_fallback(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_prepublic_api_failure")
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+    cached = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "live",
+        "privacy": "unlisted",
+    }
+    failure = supervisor.ApiCommandError(
+        returncode=75,
+        payload={"message": "rate limited", "retry_class": "quota"},
+    )
+    monkeypatch.setattr(supervisor, "manage_youtube_lifecycle", lambda _runtime: (_ for _ in ()).throw(failure))
+
+    with pytest.raises(supervisor.ApiCommandError):
+        supervisor.manage_with_public_fallback(runtime, cached)
+
+
+def test_supervisor_lock_rejects_second_instance(load_script, monkeypatch, tmp_path):
+    supervisor = load_script("youtube-autoencoder", "yta_supervisor_lock")
+    monkeypatch.setattr(supervisor, "SUPERVISOR_LOCK_FILE", tmp_path / "supervisor.lock")
+
+    with supervisor.supervisor_lock():
+        with pytest.raises(RuntimeError, match="another supervisor"):
+            with supervisor.supervisor_lock():
+                pass
