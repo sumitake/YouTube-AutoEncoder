@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import pathlib
+import sys
 import types
 
 import pytest
@@ -16,6 +17,7 @@ def load_script(script_name: str, module_name: str) -> types.ModuleType:
     spec = importlib.util.spec_from_loader(module_name, loader)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     loader.exec_module(module)
     return module
 

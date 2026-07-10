@@ -4,18 +4,23 @@
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
+import random
 import re
 import selectors
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 from urllib.parse import urlsplit
-
 
 HOME = pathlib.Path.home()
 OBS_PROFILE_DIR = pathlib.Path(
@@ -34,6 +39,113 @@ stopping = False
 URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+(?::[^/\s@]*)?@")
 RTMP_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>rtmps?://[^\s/]+/)[^\s]+")
 YOUTUBE_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>https?://[^\s/]*(?:youtube|google)[^\s/]*/)[^\s]+")
+PROGRESS_LINE_RE = re.compile(r"^[A-Za-z0-9_]+=.*$")
+RTSP_OPTION_CACHE: dict[tuple[str, str], bool] = {}
+SUPERVISOR_LOCK_FILE = pathlib.Path(
+    os.environ.get("YTA_SUPERVISOR_LOCK_FILE", HOME / ".config/youtube-autoencoder/supervisor.lock")
+).expanduser()
+RETRY_LIMITS = {
+    "source": (10.0, 300.0),
+    "api": (30.0, 900.0),
+    "quota": (900.0, 21600.0),
+    "ambiguous": (300.0, 3600.0),
+}
+LIFECYCLE_ACTIONS = {
+    "created": "testing",
+    "ready": "testing",
+    "testStarting": "poll",
+    "testing": "live",
+    "liveStarting": "poll",
+    "live": "confirm",
+}
+
+
+class EncoderStopped(RuntimeError):
+    """Raised when FFmpeg exits or stops making media progress."""
+
+
+class SourceUnavailable(RuntimeError):
+    """Raised when the configured source cannot be read."""
+
+
+class ApiCommandError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        returncode: int,
+        payload: dict[str, Any] | None = None,
+        output: str = "",
+    ) -> None:
+        self.returncode = returncode
+        self.payload = payload or {}
+        self.http_status = self.payload.get("http_status")
+        self.reasons = tuple(str(reason) for reason in self.payload.get("reasons") or [])
+        self.retry_class = str(self.payload.get("retry_class") or "fatal")
+        retry_after = self.payload.get("retry_after")
+        try:
+            self.retry_after = float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            self.retry_after = None
+        message = str(self.payload.get("message") or output or "YouTube API helper failed")
+        super().__init__(redact_text(message))
+
+
+@dataclasses.dataclass
+class ProgressWatchdog:
+    started_at: float
+    timeout: float
+    last_progress_at: float | None = None
+    last_out_time_us: int = -1
+
+    def observe(self, line: str, now: float) -> bool:
+        key, separator, raw_value = line.strip().partition("=")
+        if separator != "=" or key != "out_time_us":
+            return False
+        try:
+            out_time_us = int(raw_value)
+        except ValueError:
+            return False
+        if out_time_us < 0 or out_time_us <= self.last_out_time_us:
+            return False
+        self.last_out_time_us = out_time_us
+        self.last_progress_at = now
+        return True
+
+    def stalled(self, now: float) -> bool:
+        if self.timeout <= 0:
+            return False
+        reference = self.last_progress_at if self.last_progress_at is not None else self.started_at
+        return now - reference > self.timeout
+
+
+@dataclasses.dataclass
+class StreamRuntime:
+    process: subprocess.Popen[Any]
+    selector: Any
+    watchdog: ProgressWatchdog
+
+
+def healthy_live_observation(observation: dict[str, Any]) -> bool:
+    return (
+        str(observation.get("stream_status") or "").lower() == "active"
+        and str(observation.get("health") or "").lower() in {"good", "ok"}
+        and str(observation.get("lifecycle") or "") == "live"
+        and bool(observation.get("encoder_alive", True))
+        and bool(observation.get("media_fresh", True))
+    )
+
+
+@dataclasses.dataclass
+class PublicationGate:
+    required: int = 2
+    streak: int = 0
+
+    def observe(self, observation: dict[str, Any]) -> bool:
+        if healthy_live_observation(observation):
+            self.streak += 1
+        else:
+            self.streak = 0
+        return self.streak >= self.required
 
 
 def log(message: str) -> None:
@@ -60,6 +172,62 @@ def parse_duration(value: str) -> float:
     number = value[:-1] if suffix in "smhd" else value
     multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(suffix, 1)
     return float(number) * multiplier
+
+
+def lifecycle_action(lifecycle: str) -> str:
+    try:
+        return LIFECYCLE_ACTIONS[lifecycle]
+    except KeyError as exc:
+        raise ApiCommandError(
+            returncode=78,
+            payload={
+                "message": f"unknown or terminal broadcast lifecycle: {lifecycle or '<empty>'}",
+                "retry_class": "ambiguous",
+            },
+        ) from exc
+
+
+def classify_api_error(error: ApiCommandError) -> str:
+    return error.retry_class if error.retry_class in RETRY_LIMITS else "ambiguous"
+
+
+def retry_delay(
+    retry_class: str,
+    *,
+    attempt: int,
+    jitter: float | None = None,
+    retry_after: float | None = None,
+) -> float:
+    if retry_class not in RETRY_LIMITS:
+        raise ValueError(f"unsupported retry class: {retry_class}")
+    if attempt < 1:
+        raise ValueError("retry attempt must be at least 1")
+    base, maximum = RETRY_LIMITS[retry_class]
+    exponent = min(attempt - 1, 30)
+    uncapped = base * (2**exponent)
+    bounded = min(maximum, uncapped)
+    delay = random.uniform(base, bounded) if jitter is None else max(0.0, bounded + jitter)
+    if retry_after is not None:
+        delay = max(delay, float(retry_after))
+    return delay
+
+
+def retry_cooldown_remaining(
+    state: dict[str, Any],
+    *,
+    now: dt.datetime | None = None,
+) -> float:
+    value = str(state.get("retry_not_before") or "")
+    if not value:
+        return 0.0
+    try:
+        deadline = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=dt.UTC)
+    current = now or dt.datetime.now(dt.UTC)
+    return max(0.0, (deadline.astimezone(dt.UTC) - current.astimezone(dt.UTC)).total_seconds())
 
 
 def redact_url(url: str) -> str:
@@ -133,9 +301,47 @@ def stream_config() -> tuple[str, str]:
     return source_url(), output_url()
 
 
-def source_available(url: str) -> bool:
+def binary_supports_rtsp_option(binary: str, option: str) -> bool:
+    cache_key = (binary, option)
+    if cache_key in RTSP_OPTION_CACHE:
+        return RTSP_OPTION_CACHE[cache_key]
+    try:
+        result = subprocess.run(
+            [binary, "-hide_banner", "-h", "demuxer=rtsp"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"could not inspect {pathlib.Path(binary).name} RTSP options: {exc}")
+        return False
+    output = "\n".join((result.stdout or "", result.stderr or ""))
+    supported = any(line.lstrip().startswith(f"-{option} ") for line in output.splitlines())
+    RTSP_OPTION_CACHE[cache_key] = supported
+    return supported
+
+
+def ffmpeg_supports_rtsp_option(option: str) -> bool:
+    return binary_supports_rtsp_option(env("YTA_FFMPEG", "ffmpeg"), option)
+
+
+def ffprobe_supports_rtsp_option(option: str) -> bool:
+    return binary_supports_rtsp_option(env("YTA_FFPROBE", "ffprobe"), option)
+
+
+def source_available(
+    url: str,
+    *,
+    rtsp_timeout_supported: bool | None = None,
+    rtsp_rw_timeout_supported: bool | None = None,
+) -> bool:
     if not bool_env("YTA_SOURCE_PROBE", True):
         return True
+    if rtsp_timeout_supported is None:
+        rtsp_timeout_supported = ffprobe_supports_rtsp_option("timeout")
+    if rtsp_rw_timeout_supported is None:
+        rtsp_rw_timeout_supported = ffprobe_supports_rtsp_option("rw_timeout")
     cmd = [
         env("YTA_FFPROBE", "ffprobe"),
         "-hide_banner",
@@ -143,18 +349,22 @@ def source_available(url: str) -> bool:
         "error",
         "-rtsp_transport",
         env("YTA_RTSP_TRANSPORT", "tcp"),
-        "-timeout",
-        env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000"),
-        "-rw_timeout",
-        env("YTA_RTSP_RW_TIMEOUT_US", "15000000"),
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=codec_name,width,height",
-        "-of",
-        "json",
-        url,
     ]
+    if rtsp_timeout_supported:
+        cmd.extend(["-timeout", env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000")])
+    if rtsp_rw_timeout_supported:
+        cmd.extend(["-rw_timeout", env("YTA_RTSP_RW_TIMEOUT_US", "15000000")])
+    cmd.extend(
+        [
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height",
+            "-of",
+            "json",
+            url,
+        ]
+    )
     try:
         result = subprocess.run(
             cmd,
@@ -177,84 +387,105 @@ def lifecycle_enabled() -> bool:
     return bool_env("YTA_YOUTUBE_LIFECYCLE", True)
 
 
+def json_object_from_output(output: str) -> dict[str, Any] | None:
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def parse_api_result(returncode: int, stdout: str, stderr: str) -> dict[str, Any]:
+    if returncode != 0:
+        payload = json_object_from_output(stderr) or json_object_from_output(stdout)
+        output = (stdout + "\n" + stderr).strip()
+        raise ApiCommandError(returncode=returncode, payload=payload, output=output)
+    output = stdout.strip()
+    if not output:
+        return {}
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ApiCommandError(
+            returncode=returncode,
+            payload={"message": f"YouTube API helper returned invalid JSON: {exc}", "retry_class": "fatal"},
+        ) from exc
+    if not isinstance(value, dict):
+        raise ApiCommandError(
+            returncode=returncode,
+            payload={"message": "YouTube API helper did not return a JSON object", "retry_class": "fatal"},
+        )
+    return value
+
+
 def api_command(args: list[str], *, timeout: int = 90) -> dict[str, Any]:
     cmd = [env("YTA_YOUTUBE_API", "youtube-autoencoder-api"), *args]
-    result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
-    if result.returncode != 0:
-        output = (result.stdout + "\n" + result.stderr).strip()
-        raise RuntimeError(f"YouTube API command failed rc={result.returncode}: {output}")
-    output = result.stdout.strip()
-    return json.loads(output) if output else {}
-
-
-def prepare_broadcast() -> dict[str, Any]:
-    args = [
-        "prepare-broadcast",
-        "--privacy",
-        env("YTA_YOUTUBE_PRIVACY", "unlisted"),
-        "--title-prefix",
-        env("YTA_YOUTUBE_TITLE_PREFIX", "AutoEncoder Live"),
-    ]
-    title = os.environ.get("YTA_YOUTUBE_TITLE")
-    if title:
-        args.extend(["--title", title])
-    if bool_env("YTA_YOUTUBE_CREATE_STREAM", True):
-        args.append("--create-stream")
-    state = api_command(args, timeout=120)
-    log(
-        "prepared YouTube broadcast "
-        f"broadcast_id={state.get('last_broadcast_id')} stream_id={state.get('last_stream_id')}"
-    )
-    return state
-
-
-def wait_stream_active(stream_id: str) -> None:
-    timeout = int(float(env("YTA_YOUTUBE_WAIT_ACTIVE_SEC", "180")))
-    result = api_command(["wait-stream-active", stream_id, "--timeout", str(timeout)], timeout=timeout + 30)
-    log(f"YouTube ingest active stream_id={result.get('stream_id')} health={result.get('health')}")
-
-
-def transition_broadcast(broadcast_id: str, status: str) -> None:
-    result = api_command(["transition", status, broadcast_id], timeout=90)
-    lifecycle = (result.get("status") or {}).get("lifeCycleStatus")
-    log(f"YouTube broadcast transition status={status} lifecycle={lifecycle}")
-
-
-def complete_broadcast(broadcast_id: str) -> None:
     try:
-        transition_broadcast(broadcast_id, "complete")
-    except Exception as exc:  # noqa: BLE001
-        log(f"could not complete YouTube broadcast {broadcast_id}: {exc}")
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ApiCommandError(
+            returncode=-1,
+            payload={
+                "message": f"YouTube API command timed out after {timeout}s",
+                "retry_class": "api",
+            },
+        ) from exc
+    except OSError as exc:
+        raise ApiCommandError(
+            returncode=-1,
+            payload={"message": f"could not start YouTube API helper: {exc}", "retry_class": "fatal"},
+        ) from exc
+    return parse_api_result(result.returncode, result.stdout, result.stderr)
 
 
-def ffmpeg_args(input_url: str, ingest_url: str) -> list[str]:
+def ffmpeg_args(
+    input_url: str,
+    ingest_url: str,
+    *,
+    rtsp_timeout_supported: bool | None = None,
+) -> list[str]:
     mode = env("YTA_MODE", "copy").lower()
     audio_rate = env("YTA_AUDIO_SAMPLE_RATE", "48000")
+    if rtsp_timeout_supported is None:
+        rtsp_timeout_supported = ffmpeg_supports_rtsp_option("timeout")
     args = [
         env("YTA_FFMPEG", "ffmpeg"),
         "-hide_banner",
         "-nostdin",
+        "-nostats",
         "-loglevel",
         env("YTA_LOGLEVEL", "info"),
+        "-stats_period",
+        env("YTA_FFMPEG_PROGRESS_INTERVAL_SEC", "5"),
+        "-progress",
+        "pipe:1",
         "-fflags",
         "+genpts",
         "-rtsp_transport",
         env("YTA_RTSP_TRANSPORT", "tcp"),
-        "-timeout",
-        env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000"),
-        "-rw_timeout",
-        env("YTA_RTSP_RW_TIMEOUT_US", "15000000"),
-        "-i",
-        input_url,
-        "-f",
-        "lavfi",
-        "-i",
-        f"anullsrc=channel_layout=stereo:sample_rate={audio_rate}",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
     ]
+    if rtsp_timeout_supported:
+        args.extend(["-timeout", env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000")])
+    args.extend(
+        [
+            "-i",
+            input_url,
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=channel_layout=stereo:sample_rate={audio_rate}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+        ]
+    )
     if mode == "copy":
         args.extend(["-c:v", "copy"])
     elif mode == "transcode":
@@ -262,8 +493,7 @@ def ffmpeg_args(input_url: str, ingest_url: str) -> list[str]:
         args.extend(
             [
                 "-vf",
-                f"scale={env('YTA_TRANSCODE_SCALE', '-2:720')},"
-                f"fps={env('YTA_FPS', '30')},format=yuv420p",
+                f"scale={env('YTA_TRANSCODE_SCALE', '-2:720')},fps={env('YTA_FPS', '30')},format=yuv420p",
                 "-c:v",
                 encoder,
                 "-b:v",
@@ -301,6 +531,399 @@ def ffmpeg_args(input_url: str, ingest_url: str) -> list[str]:
     return args
 
 
+def drain_ffmpeg_output(runtime: StreamRuntime, timeout: float = 0.0) -> int:
+    drained = 0
+    for key, _mask in runtime.selector.select(timeout=timeout):
+        line = key.fileobj.readline()
+        if not line:
+            continue
+        drained += 1
+        stripped = line.rstrip()
+        runtime.watchdog.observe(stripped, now=time.monotonic())
+        if not PROGRESS_LINE_RE.fullmatch(stripped):
+            log("ffmpeg: " + redact_text(stripped))
+    return drained
+
+
+def stop_process(process: subprocess.Popen[Any], timeout: float = 5.0) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
+
+
+def stop_ffmpeg_process(process: subprocess.Popen[Any], timeout: float = 20.0) -> None:
+    if process.poll() is not None:
+        return
+    process.send_signal(signal.SIGINT)
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def ensure_encoder_running(runtime: StreamRuntime) -> None:
+    returncode = runtime.process.poll()
+    if returncode is not None:
+        raise EncoderStopped(f"ffmpeg exited rc={returncode}")
+    if runtime.watchdog.stalled(now=time.monotonic()):
+        stop_ffmpeg_process(runtime.process)
+        raise EncoderStopped("ffmpeg media progress stalled")
+
+
+def api_command_while_streaming(
+    args: list[str],
+    runtime: StreamRuntime,
+    timeout: int,
+) -> dict[str, Any]:
+    cmd = [env("YTA_YOUTUBE_API", "youtube-autoencoder-api"), *args]
+    with (
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout_file,
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file,
+    ):
+        try:
+            api_process = subprocess.Popen(
+                cmd,
+                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+        except OSError as exc:
+            raise ApiCommandError(
+                returncode=-1,
+                payload={"message": f"could not start YouTube API helper: {exc}", "retry_class": "fatal"},
+            ) from exc
+        deadline = time.monotonic() + timeout
+        try:
+            while api_process.poll() is None:
+                remaining = max(0.0, deadline - time.monotonic())
+                drain_ffmpeg_output(runtime, timeout=min(0.5, remaining))
+                ensure_encoder_running(runtime)
+                if time.monotonic() >= deadline:
+                    raise ApiCommandError(
+                        returncode=-1,
+                        payload={
+                            "message": f"YouTube API command timed out after {timeout}s",
+                            "retry_class": "api",
+                        },
+                    )
+            drain_ffmpeg_output(runtime, timeout=0.0)
+            ensure_encoder_running(runtime)
+            api_process.wait()
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read()
+            stderr = stderr_file.read()
+        except BaseException:
+            stop_process(api_process)
+            raise
+    return parse_api_result(api_process.returncode, stdout, stderr)
+
+
+def poll_interval() -> float:
+    return max(0.0, float(env("YTA_YOUTUBE_POLL_INTERVAL_SEC", "5")))
+
+
+def transition_timeout() -> float:
+    return max(1.0, float(env("YTA_YOUTUBE_TRANSITION_TIMEOUT_SEC", "180")))
+
+
+def wait_with_runtime(runtime: StreamRuntime, duration: float) -> None:
+    ensure_encoder_running(runtime)
+    deadline = time.monotonic() + max(0.0, duration)
+    while not stopping and time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        drain_ffmpeg_output(runtime, timeout=min(0.5, remaining))
+        ensure_encoder_running(runtime)
+    ensure_encoder_running(runtime)
+
+
+def runtime_health(runtime: StreamRuntime) -> dict[str, bool]:
+    now = time.monotonic()
+    return {
+        "encoder_alive": runtime.process.poll() is None,
+        "media_fresh": runtime.watchdog.last_progress_at is not None and not runtime.watchdog.stalled(now=now),
+    }
+
+
+def current_observation(runtime: StreamRuntime, state: dict[str, Any]) -> dict[str, Any]:
+    stream_id = str(state.get("stream_id") or state.get("last_stream_id") or "")
+    broadcast_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
+    if not stream_id or not broadcast_id:
+        raise ApiCommandError(
+            returncode=78,
+            payload={"message": "managed lifecycle state is missing IDs", "retry_class": "ambiguous"},
+        )
+    ensure_encoder_running(runtime)
+    stream = api_command_while_streaming(["stream-status", stream_id], runtime, timeout=45)
+    broadcast = api_command_while_streaming(["broadcast-status", broadcast_id], runtime, timeout=45)
+    ensure_encoder_running(runtime)
+    return {
+        "stream_status": stream.get("stream_status"),
+        "health": stream.get("health"),
+        "configuration_issues": stream.get("configuration_issues") or [],
+        "lifecycle": broadcast.get("lifecycle"),
+        "privacy": broadcast.get("privacy"),
+        **runtime_health(runtime),
+    }
+
+
+def wait_for_active_stream(runtime: StreamRuntime) -> dict[str, Any]:
+    deadline = time.monotonic() + transition_timeout()
+    while True:
+        status = api_command_while_streaming(["stream-status"], runtime, timeout=45)
+        health = runtime_health(runtime)
+        if status.get("stream_status") == "active" and health["media_fresh"]:
+            log(f"YouTube ingest active stream_id={status.get('stream_id')} health={status.get('health')}")
+            return status
+        if time.monotonic() >= deadline:
+            raise EncoderStopped("FFmpeg did not produce active YouTube ingest before timeout")
+        wait_with_runtime(runtime, poll_interval())
+
+
+def reconcile_command_args() -> list[str]:
+    args = [
+        "reconcile-broadcast",
+        "--allow-create",
+        "--privacy",
+        env("YTA_YOUTUBE_STAGING_PRIVACY", "unlisted"),
+        "--title-prefix",
+        env("YTA_YOUTUBE_TITLE_PREFIX", "AutoEncoder Live"),
+    ]
+    title = os.environ.get("YTA_YOUTUBE_TITLE")
+    if title:
+        args.extend(["--title", title])
+    return args
+
+
+def require_transition_health(observation: dict[str, Any]) -> None:
+    if observation.get("stream_status") != "active":
+        raise EncoderStopped("YouTube ingest became inactive before lifecycle transition")
+    if not observation.get("encoder_alive") or not observation.get("media_fresh"):
+        raise EncoderStopped("FFmpeg became unhealthy before lifecycle transition")
+
+
+def reconcile_lifecycle(runtime: StreamRuntime, initial_state: dict[str, Any]) -> dict[str, Any]:
+    state = dict(initial_state)
+    deadline = time.monotonic() + transition_timeout()
+    while True:
+        ensure_encoder_running(runtime)
+        lifecycle = str(state.get("lifecycle") or state.get("last_known_lifecycle") or "")
+        action = lifecycle_action(lifecycle)
+        if action == "confirm":
+            return state
+        if time.monotonic() >= deadline:
+            raise ApiCommandError(
+                returncode=-1,
+                payload={
+                    "message": f"broadcast lifecycle did not stabilize before timeout: {lifecycle}",
+                    "retry_class": "api",
+                },
+            )
+        if lifecycle == "created" or action == "poll":
+            wait_with_runtime(runtime, poll_interval())
+            observation = current_observation(runtime, state)
+            state["lifecycle"] = observation.get("lifecycle")
+            state["privacy"] = observation.get("privacy")
+            continue
+
+        observation = current_observation(runtime, state)
+        require_transition_health(observation)
+        broadcast_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
+        result = api_command_while_streaming(
+            ["transition", action, broadcast_id],
+            runtime,
+            timeout=90,
+        )
+        state["lifecycle"] = (result.get("status") or {}).get("lifeCycleStatus")
+        log(f"YouTube broadcast transition requested={action} lifecycle={state['lifecycle']}")
+        observation = current_observation(runtime, state)
+        require_transition_health(observation)
+        state["lifecycle"] = observation.get("lifecycle")
+        state["privacy"] = observation.get("privacy")
+
+
+def publish_when_healthy(runtime: StreamRuntime, initial_state: dict[str, Any]) -> dict[str, Any]:
+    state = dict(initial_state)
+    ensure_encoder_running(runtime)
+    final_privacy = env("YTA_YOUTUBE_LIVE_PRIVACY", "public")
+    current_privacy = str(state.get("privacy") or state.get("last_known_privacy") or "")
+    if current_privacy == "public" or current_privacy == final_privacy:
+        api_command_while_streaming(["clear-retry"], runtime, timeout=30)
+        log(
+            "YouTube broadcast stable "
+            f"broadcast_id={state.get('broadcast_id')} lifecycle=live privacy={current_privacy}"
+        )
+        return state
+
+    gate = PublicationGate(required=2)
+    deadline = time.monotonic() + transition_timeout()
+    while time.monotonic() < deadline:
+        observation = current_observation(runtime, state)
+        if gate.observe(observation):
+            ensure_encoder_running(runtime)
+            broadcast_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
+            result = api_command_while_streaming(
+                ["set-privacy", final_privacy, broadcast_id],
+                runtime,
+                timeout=90,
+            )
+            if result.get("privacy") != final_privacy:
+                raise ApiCommandError(
+                    returncode=78,
+                    payload={
+                        "message": "broadcast privacy readback did not match requested visibility",
+                        "retry_class": "ambiguous",
+                    },
+                )
+            state["privacy"] = final_privacy
+            api_command_while_streaming(["clear-retry"], runtime, timeout=30)
+            log(f"YouTube broadcast published broadcast_id={broadcast_id} lifecycle=live privacy={final_privacy}")
+            return state
+        wait_with_runtime(runtime, poll_interval())
+    raise EncoderStopped("YouTube stream did not remain healthy long enough for publication")
+
+
+def manage_youtube_lifecycle(runtime: StreamRuntime) -> dict[str, Any]:
+    active_stream = wait_for_active_stream(runtime)
+    state = api_command_while_streaming(reconcile_command_args(), runtime, timeout=120)
+    stream_id = str(state.get("stream_id") or state.get("last_stream_id") or "")
+    broadcast_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
+    if not stream_id or not broadcast_id:
+        raise ApiCommandError(
+            returncode=78,
+            payload={"message": "reconciliation returned incomplete lifecycle state", "retry_class": "ambiguous"},
+        )
+    if active_stream.get("stream_id") != stream_id:
+        raise ApiCommandError(
+            returncode=78,
+            payload={
+                "message": "active ingest stream did not match reconciled reusable stream",
+                "retry_class": "ambiguous",
+            },
+        )
+    log(f"reconciled YouTube broadcast broadcast_id={broadcast_id} stream_id={stream_id}")
+    state = reconcile_lifecycle(runtime, state)
+    return publish_when_healthy(runtime, state)
+
+
+def verified_public_state(state: dict[str, Any]) -> bool:
+    lifecycle = str(state.get("lifecycle") or state.get("last_known_lifecycle") or "")
+    privacy = str(state.get("privacy") or state.get("last_known_privacy") or "")
+    stream_id = str(state.get("stream_id") or state.get("last_stream_id") or "")
+    broadcast_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
+    return lifecycle == "live" and privacy == "public" and bool(stream_id and broadcast_id)
+
+
+def manage_with_public_fallback(runtime: StreamRuntime, cached_state: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return manage_youtube_lifecycle(runtime)
+    except ApiCommandError as error:
+        if not verified_public_state(cached_state):
+            raise
+        ensure_encoder_running(runtime)
+        retry_class = classify_api_error(error)
+        attempt = retry_attempt(cached_state, retry_class)
+        delay = retry_delay(retry_class, attempt=attempt, retry_after=error.retry_after)
+        not_before = retry_not_before(delay)
+        try:
+            api_command_while_streaming(
+                ["set-retry", retry_class, str(attempt), not_before],
+                runtime,
+                timeout=30,
+            )
+        except EncoderStopped:
+            raise
+        except Exception as persist_error:  # noqa: BLE001
+            log(f"could not persist public-stream API cooldown: {redact_text(str(persist_error))}")
+        ensure_encoder_running(runtime)
+        log(
+            "YouTube API unavailable; preserving verified public stream without mutation "
+            f"class={retry_class} attempt={attempt} retry_not_before={not_before}"
+        )
+        return dict(cached_state)
+
+
+@contextlib.contextmanager
+def supervisor_lock():
+    SUPERVISOR_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with SUPERVISOR_LOCK_FILE.open("a+", encoding="utf-8") as handle:
+        os.chmod(SUPERVISOR_LOCK_FILE, 0o600)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            holder = handle.read().strip() or "unknown holder"
+            raise RuntimeError(f"another supervisor instance holds the lock: {holder}") from None
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def retry_not_before(delay: float, *, now: dt.datetime | None = None) -> str:
+    current = now or dt.datetime.now(dt.UTC)
+    deadline = current.astimezone(dt.UTC) + dt.timedelta(seconds=max(0.0, delay))
+    return deadline.isoformat().replace("+00:00", "Z")
+
+
+def retry_attempt(state: dict[str, Any], retry_class: str) -> int:
+    if state.get("retry_class") != retry_class:
+        return 1
+    try:
+        return max(1, int(state.get("retry_attempt") or 0) + 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def persist_retry(retry_class: str, attempt: int, delay: float) -> str:
+    not_before = retry_not_before(delay)
+    api_command(
+        ["set-retry", retry_class, str(attempt), not_before],
+        timeout=30,
+    )
+    return not_before
+
+
+def sleep_interruptibly(duration: float) -> None:
+    deadline = time.monotonic() + max(0.0, duration)
+    while not stopping and time.monotonic() < deadline:
+        time.sleep(min(1.0, deadline - time.monotonic()))
+
+
+def failure_retry_class(error: BaseException) -> str:
+    if isinstance(error, SourceUnavailable | EncoderStopped):
+        return "source"
+    if isinstance(error, ApiCommandError):
+        return classify_api_error(error)
+    return "ambiguous"
+
+
+def read_recovery_state() -> dict[str, Any]:
+    return api_command(["state"], timeout=30)
+
+
+def supervise_stream(runtime: StreamRuntime, *, started_at: float, max_runtime: float) -> int:
+    while not stopping:
+        drain_ffmpeg_output(runtime, timeout=1.0)
+        ensure_encoder_running(runtime)
+        if max_runtime and time.monotonic() - started_at > max_runtime:
+            log(f"max runtime {max_runtime:.0f}s reached; rotating ffmpeg without completing broadcast")
+            stop_ffmpeg_process(runtime.process)
+            return int(runtime.process.returncode or 0)
+    stop_ffmpeg_process(runtime.process)
+    return int(runtime.process.returncode or 0)
+
+
 def stop_child(signum: int, _frame: Any) -> None:
     global stopping
     stopping = True
@@ -309,24 +932,15 @@ def stop_child(signum: int, _frame: Any) -> None:
         child.send_signal(signal.SIGINT)
 
 
-def run_once() -> int:
+def run_once(cached_state: dict[str, Any] | None = None) -> int:
     global child
     input_url, ingest_url = stream_config()
     max_runtime = parse_duration(env("YTA_MAX_RUNTIME", "0"))
-    started = time.monotonic()
-    broadcast_id = ""
-    stream_id = ""
     if not source_available(input_url):
-        return 1
-    if lifecycle_enabled():
-        state = prepare_broadcast()
-        broadcast_id = str(state.get("last_broadcast_id") or "")
-        stream_id = str(state.get("last_stream_id") or "")
-        if not broadcast_id or not stream_id:
-            raise RuntimeError("prepare-broadcast returned incomplete state")
-        input_url, ingest_url = stream_config()
+        raise SourceUnavailable("camera source probe failed")
 
     log(f"starting ffmpeg mode={env('YTA_MODE', 'copy')}")
+    started = time.monotonic()
     child = subprocess.Popen(
         ffmpeg_args(input_url, ingest_url),
         stderr=subprocess.STDOUT,
@@ -337,63 +951,77 @@ def run_once() -> int:
     selector = selectors.DefaultSelector()
     if child.stdout is not None:
         selector.register(child.stdout, selectors.EVENT_READ)
+    runtime = StreamRuntime(
+        process=child,
+        selector=selector,
+        watchdog=ProgressWatchdog(
+            started_at=started,
+            timeout=float(env("YTA_FFMPEG_PROGRESS_TIMEOUT_SEC", "45")),
+        ),
+    )
     try:
+        if bool_env("YTA_YOUTUBE_COMPLETE_ON_EXIT", False):
+            log("YTA_YOUTUBE_COMPLETE_ON_EXIT is deprecated and ignored; use the explicit complete command")
         if lifecycle_enabled():
-            wait_stream_active(stream_id)
-            transition_broadcast(broadcast_id, "testing")
-            time.sleep(int(float(env("YTA_YOUTUBE_TESTING_DELAY_SEC", "8"))))
-            transition_broadcast(broadcast_id, "live")
-        while child.poll() is None:
-            for key, _mask in selector.select(timeout=1):
-                line = key.fileobj.readline()
-                if line:
-                    log("ffmpeg: " + redact_text(line.rstrip()))
-            if stopping:
-                break
-            if max_runtime and time.monotonic() - started > max_runtime:
-                log(f"max runtime {max_runtime:.0f}s reached; rotating ffmpeg")
-                child.send_signal(signal.SIGINT)
-                break
-        try:
-            rc = child.wait(timeout=20)
-            if child.stdout is not None:
-                for line in child.stdout:
-                    log("ffmpeg: " + redact_text(line.rstrip()))
-            return rc
-        except subprocess.TimeoutExpired:
-            log("ffmpeg did not stop cleanly; killing")
-            child.kill()
-            return child.wait(timeout=10)
+            manage_with_public_fallback(runtime, cached_state or {})
+        return supervise_stream(runtime, started_at=started, max_runtime=max_runtime)
     finally:
         if child and child.poll() is None:
             log("stopping ffmpeg after interrupted stream attempt")
-            child.send_signal(signal.SIGINT)
-            try:
-                child.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                log("ffmpeg did not stop cleanly; killing")
-                child.kill()
-                child.wait(timeout=10)
-        if broadcast_id and bool_env("YTA_YOUTUBE_COMPLETE_ON_EXIT", True):
-            complete_broadcast(broadcast_id)
+            stop_ffmpeg_process(child)
         selector.close()
         child = None
+
+
+def supervisor_loop() -> int:
+    while not stopping:
+        try:
+            state = read_recovery_state()
+        except Exception as exc:  # noqa: BLE001
+            log(f"could not read local recovery state: {redact_text(str(exc))}")
+            state = {}
+        cooldown = retry_cooldown_remaining(state)
+        if cooldown > 0:
+            log(
+                f"recovery cooldown class={state.get('retry_class')} "
+                f"attempt={state.get('retry_attempt')} remaining={cooldown:.0f}s"
+            )
+            sleep_interruptibly(cooldown)
+            continue
+        try:
+            rc = run_once(cached_state=state)
+            if stopping:
+                break
+            raise EncoderStopped(f"ffmpeg stream attempt exited rc={rc}")
+        except Exception as exc:  # noqa: BLE001
+            if stopping:
+                break
+            retry_class = failure_retry_class(exc)
+            try:
+                state = read_recovery_state()
+            except Exception:  # noqa: BLE001
+                pass
+            attempt = retry_attempt(state, retry_class)
+            retry_after = exc.retry_after if isinstance(exc, ApiCommandError) else None
+            delay = retry_delay(retry_class, attempt=attempt, retry_after=retry_after)
+            try:
+                not_before = persist_retry(retry_class, attempt, delay)
+            except Exception as persist_error:  # noqa: BLE001
+                not_before = "not persisted"
+                log(f"could not persist recovery cooldown: {redact_text(str(persist_error))}")
+            log(
+                f"stream attempt failed class={retry_class} attempt={attempt} "
+                f"retry_in={delay:.0f}s retry_not_before={not_before}: {redact_text(str(exc))}"
+            )
+            sleep_interruptibly(delay)
+    return 0
 
 
 def main() -> int:
     signal.signal(signal.SIGTERM, stop_child)
     signal.signal(signal.SIGINT, stop_child)
-    delay = parse_duration(env("YTA_RESTART_DELAY", "10s"))
-    while not stopping:
-        try:
-            rc = run_once()
-            log(f"stream attempt exited rc={rc}")
-        except Exception as exc:  # noqa: BLE001
-            log(f"streamer setup failed: {exc}")
-        if not stopping:
-            log(f"restarting in {delay:.0f}s")
-            time.sleep(delay)
-    return 0
+    with supervisor_lock():
+        return supervisor_loop()
 
 
 if __name__ == "__main__":
