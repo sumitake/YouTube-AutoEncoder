@@ -248,7 +248,8 @@ def http_json(
             try:
                 retry_after = float(retry_after_value)
             except ValueError:
-                pass
+                # Retry-After is optional; malformed hints fall back to class-based backoff.
+                retry_after = None
         raise YouTubeApiError(
             status=exc.code,
             reasons=reasons,
