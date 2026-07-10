@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import pathlib
@@ -15,7 +16,6 @@ import sys
 import time
 from typing import Any
 from urllib.parse import urlsplit
-
 
 HOME = pathlib.Path.home()
 OBS_PROFILE_DIR = pathlib.Path(
@@ -34,6 +34,68 @@ stopping = False
 URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+(?::[^/\s@]*)?@")
 RTMP_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>rtmps?://[^\s/]+/)[^\s]+")
 YOUTUBE_SECRET_PATH_RE = re.compile(r"(?i)\b(?P<prefix>https?://[^\s/]*(?:youtube|google)[^\s/]*/)[^\s]+")
+PROGRESS_LINE_RE = re.compile(r"^[A-Za-z0-9_]+=.*$")
+
+
+class EncoderStopped(RuntimeError):
+    """Raised when FFmpeg exits or stops making media progress."""
+
+
+class ApiCommandError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        returncode: int,
+        payload: dict[str, Any] | None = None,
+        output: str = "",
+    ) -> None:
+        self.returncode = returncode
+        self.payload = payload or {}
+        self.http_status = self.payload.get("http_status")
+        self.reasons = tuple(str(reason) for reason in self.payload.get("reasons") or [])
+        self.retry_class = str(self.payload.get("retry_class") or "fatal")
+        retry_after = self.payload.get("retry_after")
+        try:
+            self.retry_after = float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            self.retry_after = None
+        message = str(self.payload.get("message") or output or "YouTube API helper failed")
+        super().__init__(redact_text(message))
+
+
+@dataclasses.dataclass
+class ProgressWatchdog:
+    started_at: float
+    timeout: float
+    last_progress_at: float | None = None
+    last_out_time_us: int = -1
+
+    def observe(self, line: str, now: float) -> bool:
+        key, separator, raw_value = line.strip().partition("=")
+        if separator != "=" or key != "out_time_us":
+            return False
+        try:
+            out_time_us = int(raw_value)
+        except ValueError:
+            return False
+        if out_time_us < 0 or out_time_us <= self.last_out_time_us:
+            return False
+        self.last_out_time_us = out_time_us
+        self.last_progress_at = now
+        return True
+
+    def stalled(self, now: float) -> bool:
+        if self.timeout <= 0:
+            return False
+        reference = self.last_progress_at if self.last_progress_at is not None else self.started_at
+        return now - reference > self.timeout
+
+
+@dataclasses.dataclass
+class StreamRuntime:
+    process: subprocess.Popen[Any]
+    selector: Any
+    watchdog: ProgressWatchdog
 
 
 def log(message: str) -> None:
@@ -133,9 +195,42 @@ def stream_config() -> tuple[str, str]:
     return source_url(), output_url()
 
 
-def source_available(url: str) -> bool:
+def binary_supports_rtsp_option(binary: str, option: str) -> bool:
+    try:
+        result = subprocess.run(
+            [binary, "-hide_banner", "-h", "demuxer=rtsp"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"could not inspect {pathlib.Path(binary).name} RTSP options: {exc}")
+        return False
+    output = "\n".join((result.stdout or "", result.stderr or ""))
+    return any(line.lstrip().startswith(f"-{option} ") for line in output.splitlines())
+
+
+def ffmpeg_supports_rtsp_option(option: str) -> bool:
+    return binary_supports_rtsp_option(env("YTA_FFMPEG", "ffmpeg"), option)
+
+
+def ffprobe_supports_rtsp_option(option: str) -> bool:
+    return binary_supports_rtsp_option(env("YTA_FFPROBE", "ffprobe"), option)
+
+
+def source_available(
+    url: str,
+    *,
+    rtsp_timeout_supported: bool | None = None,
+    rtsp_rw_timeout_supported: bool | None = None,
+) -> bool:
     if not bool_env("YTA_SOURCE_PROBE", True):
         return True
+    if rtsp_timeout_supported is None:
+        rtsp_timeout_supported = ffprobe_supports_rtsp_option("timeout")
+    if rtsp_rw_timeout_supported is None:
+        rtsp_rw_timeout_supported = ffprobe_supports_rtsp_option("rw_timeout")
     cmd = [
         env("YTA_FFPROBE", "ffprobe"),
         "-hide_banner",
@@ -143,18 +238,22 @@ def source_available(url: str) -> bool:
         "error",
         "-rtsp_transport",
         env("YTA_RTSP_TRANSPORT", "tcp"),
-        "-timeout",
-        env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000"),
-        "-rw_timeout",
-        env("YTA_RTSP_RW_TIMEOUT_US", "15000000"),
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=codec_name,width,height",
-        "-of",
-        "json",
-        url,
     ]
+    if rtsp_timeout_supported:
+        cmd.extend(["-timeout", env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000")])
+    if rtsp_rw_timeout_supported:
+        cmd.extend(["-rw_timeout", env("YTA_RTSP_RW_TIMEOUT_US", "15000000")])
+    cmd.extend(
+        [
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height",
+            "-of",
+            "json",
+            url,
+        ]
+    )
     try:
         result = subprocess.run(
             cmd,
@@ -177,14 +276,47 @@ def lifecycle_enabled() -> bool:
     return bool_env("YTA_YOUTUBE_LIFECYCLE", True)
 
 
+def json_object_from_output(output: str) -> dict[str, Any] | None:
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def parse_api_result(returncode: int, stdout: str, stderr: str) -> dict[str, Any]:
+    if returncode != 0:
+        payload = json_object_from_output(stderr) or json_object_from_output(stdout)
+        output = (stdout + "\n" + stderr).strip()
+        raise ApiCommandError(returncode=returncode, payload=payload, output=output)
+    output = stdout.strip()
+    if not output:
+        return {}
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ApiCommandError(
+            returncode=returncode,
+            payload={"message": f"YouTube API helper returned invalid JSON: {exc}", "retry_class": "fatal"},
+        ) from exc
+    if not isinstance(value, dict):
+        raise ApiCommandError(
+            returncode=returncode,
+            payload={"message": "YouTube API helper did not return a JSON object", "retry_class": "fatal"},
+        )
+    return value
+
+
 def api_command(args: list[str], *, timeout: int = 90) -> dict[str, Any]:
     cmd = [env("YTA_YOUTUBE_API", "youtube-autoencoder-api"), *args]
     result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
-    if result.returncode != 0:
-        output = (result.stdout + "\n" + result.stderr).strip()
-        raise RuntimeError(f"YouTube API command failed rc={result.returncode}: {output}")
-    output = result.stdout.strip()
-    return json.loads(output) if output else {}
+    return parse_api_result(result.returncode, result.stdout, result.stderr)
 
 
 def prepare_broadcast() -> dict[str, Any]:
@@ -227,34 +359,48 @@ def complete_broadcast(broadcast_id: str) -> None:
         log(f"could not complete YouTube broadcast {broadcast_id}: {exc}")
 
 
-def ffmpeg_args(input_url: str, ingest_url: str) -> list[str]:
+def ffmpeg_args(
+    input_url: str,
+    ingest_url: str,
+    *,
+    rtsp_timeout_supported: bool | None = None,
+) -> list[str]:
     mode = env("YTA_MODE", "copy").lower()
     audio_rate = env("YTA_AUDIO_SAMPLE_RATE", "48000")
+    if rtsp_timeout_supported is None:
+        rtsp_timeout_supported = ffmpeg_supports_rtsp_option("timeout")
     args = [
         env("YTA_FFMPEG", "ffmpeg"),
         "-hide_banner",
         "-nostdin",
+        "-nostats",
         "-loglevel",
         env("YTA_LOGLEVEL", "info"),
+        "-stats_period",
+        env("YTA_FFMPEG_PROGRESS_INTERVAL_SEC", "5"),
+        "-progress",
+        "pipe:1",
         "-fflags",
         "+genpts",
         "-rtsp_transport",
         env("YTA_RTSP_TRANSPORT", "tcp"),
-        "-timeout",
-        env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000"),
-        "-rw_timeout",
-        env("YTA_RTSP_RW_TIMEOUT_US", "15000000"),
-        "-i",
-        input_url,
-        "-f",
-        "lavfi",
-        "-i",
-        f"anullsrc=channel_layout=stereo:sample_rate={audio_rate}",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
     ]
+    if rtsp_timeout_supported:
+        args.extend(["-timeout", env("YTA_RTSP_CONNECT_TIMEOUT_US", "5000000")])
+    args.extend(
+        [
+            "-i",
+            input_url,
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=channel_layout=stereo:sample_rate={audio_rate}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+        ]
+    )
     if mode == "copy":
         args.extend(["-c:v", "copy"])
     elif mode == "transcode":
@@ -262,8 +408,7 @@ def ffmpeg_args(input_url: str, ingest_url: str) -> list[str]:
         args.extend(
             [
                 "-vf",
-                f"scale={env('YTA_TRANSCODE_SCALE', '-2:720')},"
-                f"fps={env('YTA_FPS', '30')},format=yuv420p",
+                f"scale={env('YTA_TRANSCODE_SCALE', '-2:720')},fps={env('YTA_FPS', '30')},format=yuv420p",
                 "-c:v",
                 encoder,
                 "-b:v",
@@ -299,6 +444,86 @@ def ffmpeg_args(input_url: str, ingest_url: str) -> list[str]:
         ]
     )
     return args
+
+
+def drain_ffmpeg_output(runtime: StreamRuntime, timeout: float = 0.0) -> int:
+    drained = 0
+    for key, _mask in runtime.selector.select(timeout=timeout):
+        line = key.fileobj.readline()
+        if not line:
+            continue
+        drained += 1
+        stripped = line.rstrip()
+        runtime.watchdog.observe(stripped, now=time.monotonic())
+        if not PROGRESS_LINE_RE.fullmatch(stripped):
+            log("ffmpeg: " + redact_text(stripped))
+    return drained
+
+
+def stop_process(process: subprocess.Popen[Any], timeout: float = 5.0) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
+
+
+def stop_ffmpeg_process(process: subprocess.Popen[Any], timeout: float = 20.0) -> None:
+    if process.poll() is not None:
+        return
+    process.send_signal(signal.SIGINT)
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def ensure_encoder_running(runtime: StreamRuntime) -> None:
+    returncode = runtime.process.poll()
+    if returncode is not None:
+        raise EncoderStopped(f"ffmpeg exited rc={returncode}")
+    if runtime.watchdog.stalled(now=time.monotonic()):
+        stop_ffmpeg_process(runtime.process)
+        raise EncoderStopped("ffmpeg media progress stalled")
+
+
+def api_command_while_streaming(
+    args: list[str],
+    runtime: StreamRuntime,
+    timeout: int,
+) -> dict[str, Any]:
+    cmd = [env("YTA_YOUTUBE_API", "youtube-autoencoder-api"), *args]
+    api_process = subprocess.Popen(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        while api_process.poll() is None:
+            remaining = max(0.0, deadline - time.monotonic())
+            drain_ffmpeg_output(runtime, timeout=min(0.5, remaining))
+            ensure_encoder_running(runtime)
+            if time.monotonic() >= deadline:
+                raise ApiCommandError(
+                    returncode=-1,
+                    payload={
+                        "message": f"YouTube API command timed out after {timeout}s",
+                        "retry_class": "api",
+                    },
+                )
+        drain_ffmpeg_output(runtime, timeout=0.0)
+        ensure_encoder_running(runtime)
+        stdout, stderr = api_process.communicate()
+    except BaseException:
+        stop_process(api_process)
+        raise
+    return parse_api_result(api_process.returncode, stdout, stderr)
 
 
 def stop_child(signum: int, _frame: Any) -> None:
