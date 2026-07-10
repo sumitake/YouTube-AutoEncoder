@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
@@ -19,12 +21,12 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-
 HOME = pathlib.Path.home()
 BASE_DIR = pathlib.Path(os.environ.get("YTA_CONFIG_DIR", HOME / ".config/youtube-autoencoder")).expanduser()
 CLIENT_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_CLIENT_FILE", BASE_DIR / "google-oauth-client.json")).expanduser()
 TOKEN_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_TOKEN_FILE", BASE_DIR / "youtube-token.json")).expanduser()
 STATE_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_STATE_FILE", BASE_DIR / "youtube-live-state.json")).expanduser()
+LOCK_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_LOCK_FILE", BASE_DIR / "youtube-live-state.lock")).expanduser()
 OBS_PROFILE_DIR = pathlib.Path(
     os.environ.get("YTA_OBS_PROFILE_DIR", HOME / ".config/obs-studio/basic/profiles/YouTube_AutoEncoder")
 ).expanduser()
@@ -34,6 +36,36 @@ API_BASE = "https://www.googleapis.com/youtube/v3"
 
 child: subprocess.Popen[Any] | None = None
 stopping = False
+RATE_LIMIT_REASONS = {
+    "dailyLimitExceeded",
+    "quotaExceeded",
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "userRequestsExceedRateLimit",
+}
+
+
+class YouTubeApiError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        status: int | None,
+        reasons: tuple[str, ...],
+        message: str,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.reasons = reasons
+        self.retry_after = retry_after
+
+    @property
+    def retry_class(self) -> str:
+        if self.status == 429 or any(reason in RATE_LIMIT_REASONS for reason in self.reasons):
+            return "quota"
+        if self.status is None or self.status >= 500:
+            return "api"
+        return "fatal"
 
 
 def log(message: str) -> None:
@@ -48,15 +80,88 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
     return data
 
 
-def write_secret_json(path: pathlib.Path, data: dict[str, Any]) -> None:
+def fsync_directory(path: pathlib.Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def write_json_durable(path: pathlib.Path, data: dict[str, Any], mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    os.chmod(tmp, 0o600)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, mode)
     tmp.replace(path)
-    os.chmod(path, 0o600)
+    os.chmod(path, mode)
+    fsync_directory(path.parent)
+
+
+def write_secret_json(path: pathlib.Path, data: dict[str, Any]) -> None:
+    write_json_durable(path, data, mode=0o600)
+
+
+def read_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return read_json(STATE_FILE)
+    except (json.JSONDecodeError, ValueError):
+        stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+        corrupt = STATE_FILE.with_name(f"{STATE_FILE.name}.corrupt.{stamp}")
+        STATE_FILE.replace(corrupt)
+        fsync_directory(STATE_FILE.parent)
+        log(f"quarantined corrupt lifecycle state at {corrupt}")
+        return {}
+
+
+@contextlib.contextmanager
+def mutation_lock(timeout: float | None = None):
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("a+", encoding="utf-8") as handle:
+        os.chmod(LOCK_FILE, 0o600)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out acquiring mutation lock {LOCK_FILE}") from None
+                time.sleep(0.05)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def error_payload(exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, YouTubeApiError):
+        return {
+            "error": True,
+            "http_status": exc.status,
+            "message": str(exc),
+            "reasons": list(exc.reasons),
+            "retry_after": exc.retry_after,
+            "retry_class": exc.retry_class,
+        }
+    return {
+        "error": True,
+        "http_status": None,
+        "message": str(exc),
+        "reasons": [],
+        "retry_after": None,
+        "retry_class": "fatal",
+    }
 
 
 def client_config() -> dict[str, str]:
@@ -101,7 +206,30 @@ def http_json(
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             parsed = {"error": raw}
-        raise RuntimeError(f"HTTP {exc.code} {url}: {json.dumps(parsed, sort_keys=True)}") from exc
+        details = parsed.get("error") if isinstance(parsed, dict) else None
+        details = details if isinstance(details, dict) else {}
+        errors = details.get("errors") or []
+        reasons = tuple(
+            str(item.get("reason"))
+            for item in errors
+            if isinstance(item, dict) and item.get("reason")
+        )
+        message = str(details.get("message") or exc.reason or "YouTube API request failed")
+        retry_after = None
+        retry_after_value = exc.headers.get("Retry-After") if exc.headers else None
+        if retry_after_value:
+            try:
+                retry_after = float(retry_after_value)
+            except ValueError:
+                pass
+        raise YouTubeApiError(
+            status=exc.code,
+            reasons=reasons,
+            message=message,
+            retry_after=retry_after,
+        ) from exc
+    except (TimeoutError, urllib.error.URLError) as exc:
+        raise YouTubeApiError(status=None, reasons=(), message=str(exc)) from exc
     if not raw:
         return {}
     parsed = json.loads(raw)
@@ -256,7 +384,7 @@ def ensure_stream(create_if_missing: bool = False) -> dict[str, Any]:
 
 
 def create_broadcast(title: str, privacy: str) -> dict[str, Any]:
-    start_time = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    start_time = (dt.datetime.now(dt.UTC) + dt.timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     body = {
         "snippet": {
             "title": title,
@@ -331,7 +459,7 @@ def prepare_broadcast(args: argparse.Namespace) -> int:
         "last_stream_id": stream_id,
         "title": title,
         "privacy": args.privacy,
-        "created_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "created_at": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
     }
     write_state(state)
     print(json.dumps(state, indent=2, sort_keys=True))
@@ -502,5 +630,16 @@ def main() -> int:
     return int(args.func(args))
 
 
+def cli_main() -> int:
+    try:
+        return main()
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        payload = error_payload(exc)
+        print(json.dumps(payload, sort_keys=True), file=sys.stderr)
+        return 75 if payload["retry_class"] in {"api", "quota"} else 78
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli_main())
