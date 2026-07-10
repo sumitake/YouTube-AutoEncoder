@@ -42,7 +42,7 @@
 - Consumes: Programmatic VS Code Remote Tunnel RPC to `rpi5-streamer2`.
 - Produces: A stopped but enabled service, a private rollback snapshot, and a redacted pre-state record.
 
-- [ ] **Step 1: Stop the defective service**
+- [x] **Step 1: Stop the defective service**
 
 Run remotely:
 
@@ -54,7 +54,7 @@ systemctl show youtube-autoencoder@josumi.service \
 
 Expected: `ActiveState=inactive`, `SubState=dead`, and `UnitFileState=enabled`.
 
-- [ ] **Step 2: Verify the retry loop is absent**
+- [x] **Step 2: Verify the retry loop is absent**
 
 Run remotely:
 
@@ -64,7 +64,7 @@ ps -eo pid,user,args | grep -E '[y]outube-autoencoder|[f]fmpeg' || true
 
 Expected: no encoder, API-helper, or FFmpeg process except the inspection shell.
 
-- [ ] **Step 3: Create a private rollback snapshot**
+- [x] **Step 3: Create a private rollback snapshot**
 
 Run remotely as root:
 
@@ -88,7 +88,7 @@ printf '%s\n' "$backup"
 
 Expected: one timestamped directory owned by `josumi`, mode `0700`, with private config/state copies.
 
-- [ ] **Step 4: Record non-secret pre-state**
+- [x] **Step 4: Record non-secret pre-state**
 
 Run remotely:
 
@@ -115,7 +115,7 @@ Expected: encoder unit remains enabled; remote-management state is captured with
 - Consumes: Existing `http_json`, `read_json`, `write_secret_json`, and CLI dispatcher.
 - Produces: `YouTubeApiError`, `write_json_durable`, `read_state`, `write_state`, `mutation_lock`, `error_payload`, and local state commands used by later tasks.
 
-- [ ] **Step 1: Write failing durable-state and error tests**
+- [x] **Step 1: Write failing durable-state and error tests**
 
 Add tests that exercise these signatures:
 
@@ -151,7 +151,7 @@ def test_mutation_lock_times_out(load_script, monkeypatch, tmp_path):
 
 Extend the existing secret-write test to assert valid JSON, mode `0600`, and no leftover `.tmp` file after replacement.
 
-- [ ] **Step 2: Run the focused tests and observe failure**
+- [x] **Step 2: Run the focused tests and observe failure**
 
 Run:
 
@@ -161,13 +161,13 @@ Run:
 
 Expected: failures because the new exception, state reader, and lock do not exist.
 
-- [ ] **Step 3: Implement the durable primitives**
+- [x] **Step 3: Implement the durable primitives**
 
 Implement these exact public signatures: `YouTubeApiError.__init__(*, status: int | None, reasons: tuple[str, ...], message: str, retry_after: float | None = None) -> None`, `write_json_durable(path: pathlib.Path, data: dict[str, Any], mode: int = 0o600) -> None`, `read_state() -> dict[str, Any]`, `write_state(data: dict[str, Any]) -> None`, `error_payload(exc: BaseException) -> dict[str, Any]`, and the context manager `mutation_lock(timeout: float | None = None)`.
 
 `write_json_durable` must flush and `fsync` the temporary file, `replace` the destination, chmod the destination, and `fsync` the parent directory. `read_state` must rename malformed JSON to `.corrupt.YYYYMMDDTHHMMSSZ` and return `{}`. `YouTubeApiError.retry_class` must map rate-limit reasons and 429 to `quota`, HTTP 5xx/timeouts to `api`, and permanent 4xx failures to `fatal`.
 
-- [ ] **Step 4: Add structured CLI failure output**
+- [x] **Step 4: Add structured CLI failure output**
 
 Wrap command dispatch so failures emit one final JSON object to stderr:
 
@@ -184,7 +184,7 @@ Wrap command dispatch so failures emit one final JSON object to stderr:
 
 Return exit code `75` for `quota` and `api`, `78` for `fatal` or ambiguous state, and preserve `130` for interruption.
 
-- [ ] **Step 5: Run API tests and commit**
+- [x] **Step 5: Run API tests and commit**
 
 Run:
 
@@ -214,7 +214,7 @@ git commit -m "api: add durable state and structured failures"
 - Consumes: Task 2 state, locking, and structured error interfaces.
 - Produces: `instance_id`, `broadcast_description`, `broadcast_by_id`, `list_managed_broadcasts`, `reconcile_broadcast`, `set_broadcast_privacy`, `stream-status`, `broadcast-status`, `reconcile-broadcast`, `set-privacy`, `state`, `set-retry`, and `clear-retry` commands.
 
-- [ ] **Step 1: Write failing marker and candidate tests**
+- [x] **Step 1: Write failing marker and candidate tests**
 
 Cover exact behavior:
 
@@ -254,7 +254,7 @@ def test_reconcile_reuses_nonterminal_broadcast_without_insert(load_script, monk
 
 Also test `created`, `ready`, `testStarting`, `testing`, and `liveStarting`; terminal replacement; unknown-state blocking; unrelated title matches; multiple marker matches; and exact generation recovery after a simulated lost insert response.
 
-- [ ] **Step 2: Run the focused tests and observe failure**
+- [x] **Step 2: Run the focused tests and observe failure**
 
 Run:
 
@@ -264,27 +264,27 @@ Run:
 
 Expected: failures because reconciliation functions do not exist.
 
-- [ ] **Step 3: Implement write-ahead reconciliation**
+- [x] **Step 3: Implement write-ahead reconciliation**
 
 Add `RECOVERABLE_STATES = {"created", "ready", "testStarting", "testing", "liveStarting", "live"}` and `TERMINAL_STATES = {"complete", "revoked"}`. Implement the exact signatures `instance_id() -> str`, `broadcast_description(instance: str, generation: str) -> str`, `broadcast_by_id(broadcast_id: str) -> dict[str, Any] | None`, `list_managed_broadcasts(instance: str) -> list[dict[str, Any]]`, and `reconcile_broadcast(*, stream_id: str, title: str, staging_privacy: str, allow_create: bool) -> dict[str, Any]`.
 
 The create path must persist `pending_action=create` and a UUID generation before `liveBroadcasts.insert`, re-list by the exact generation marker, then insert only when absent. Persist the returned ID before bind. A retry after bind/transition failure must never call insert.
 
-- [ ] **Step 4: Add one-shot status and privacy operations**
+- [x] **Step 4: Add one-shot status and privacy operations**
 
 Implement the exact signatures `stream_status(stream_id: str | None = None) -> dict[str, Any]`, `broadcast_status(broadcast_id: str) -> dict[str, Any]`, and `set_broadcast_privacy(broadcast_id: str, privacy: str) -> dict[str, Any]`.
 
 `set_broadcast_privacy` must fetch the current resource, preserve every field required by `liveBroadcasts.update`, update only privacy, then fetch and verify the readback. All mutations acquire `mutation_lock`; read-only status commands do not.
 
-- [ ] **Step 5: Add persisted retry commands**
+- [x] **Step 5: Add persisted retry commands**
 
 `set-retry` stores `retry_class`, `retry_attempt`, and UTC `retry_not_before` in schema version 2 without removing broadcast identity. `clear-retry` removes those values only after sustained progress or a stable public state. `state` returns the cache without secret values.
 
-- [ ] **Step 6: Keep compatibility commands safe**
+- [x] **Step 6: Keep compatibility commands safe**
 
 Change `prepare-broadcast` to call reconciliation instead of unconditional insert. Remove automatic completion from `run-visible-test` failure paths; a test may complete only its known live broadcast when explicitly requested.
 
-- [ ] **Step 7: Run API tests and commit**
+- [x] **Step 7: Run API tests and commit**
 
 Run:
 
@@ -314,7 +314,7 @@ git commit -m "api: reconcile one managed YouTube broadcast"
 - Consumes: Existing source discovery, source probe, redaction, and FFmpeg argument functions.
 - Produces: `ffmpeg_supports_rtsp_option`, `ProgressWatchdog`, `drain_ffmpeg_output`, `ApiCommandError`, and `api_command_while_streaming`.
 
-- [ ] **Step 1: Write failing FFmpeg compatibility and progress tests**
+- [x] **Step 1: Write failing FFmpeg compatibility and progress tests**
 
 Add:
 
@@ -337,7 +337,7 @@ def test_progress_watchdog_detects_stall(load_script):
 
 Also test that an unsupported capability omits `-timeout`, normal log lines do not count as progress, and stream-key/camera credentials remain redacted.
 
-- [ ] **Step 2: Run focused tests and observe failure**
+- [x] **Step 2: Run focused tests and observe failure**
 
 Run:
 
@@ -347,7 +347,7 @@ Run:
 
 Expected: failures because the new interfaces do not exist and current args contain `-rw_timeout`.
 
-- [ ] **Step 3: Implement capability-safe FFmpeg arguments**
+- [x] **Step 3: Implement capability-safe FFmpeg arguments**
 
 Add a five-second capability probe:
 
@@ -365,17 +365,17 @@ def ffmpeg_supports_rtsp_option(option: str) -> bool:
 
 Change `ffmpeg_args` to accept `rtsp_timeout_supported: bool | None = None`, omit `-rw_timeout`, optionally include `-timeout`, and add `-stats_period 5 -progress pipe:1`.
 
-- [ ] **Step 4: Implement progress parsing and child-aware API waits**
+- [x] **Step 4: Implement progress parsing and child-aware API waits**
 
 Add a `@dataclasses.dataclass` named `ProgressWatchdog` with fields `started_at: float`, `timeout: float`, `last_progress_at: float | None = None`, and `last_out_time_us: int = -1`. Implement `observe(self, line: str, now: float) -> bool` and `stalled(self, now: float) -> bool`; only a strictly increasing nonnegative `out_time_us` refreshes progress.
 
 `api_command_while_streaming(args, runtime, timeout)` starts the API helper with `Popen`, drains FFmpeg through the existing selector every 0.5 seconds, checks `child.poll()`, checks the watchdog, and terminates the helper when FFmpeg exits or stalls. Only after the helper exits does it parse its small stdout/stderr result.
 
-- [ ] **Step 5: Test early-child-exit cancellation**
+- [x] **Step 5: Test early-child-exit cancellation**
 
 Use fake `Popen` objects to prove an API wait is terminated and raises `EncoderStopped` when the FFmpeg child exits. Assert no later lifecycle callback executes.
 
-- [ ] **Step 6: Run supervisor tests and commit**
+- [x] **Step 6: Run supervisor tests and commit**
 
 Run:
 
@@ -405,7 +405,7 @@ git commit -m "encoder: supervise FFmpeg during API operations"
 - Consumes: Task 3 API commands and Task 4 child-aware runtime.
 - Produces: `classify_api_error`, `retry_delay`, `reconcile_lifecycle`, `healthy_live_observation`, and the production recovery loop.
 
-- [ ] **Step 1: Write failing backoff and lifecycle matrix tests**
+- [x] **Step 1: Write failing backoff and lifecycle matrix tests**
 
 Add parameterized tests:
 
@@ -434,7 +434,7 @@ def test_quota_backoff_is_long_and_capped(load_script):
 
 Also test source/API/ambiguous delays, `Retry-After`, persisted future cooldown on startup, and no API polling after stable public state.
 
-- [ ] **Step 2: Write failing publication-gate tests**
+- [x] **Step 2: Write failing publication-gate tests**
 
 Prove two observations are required and that all fields gate promotion:
 
@@ -449,7 +449,7 @@ def test_publication_requires_two_healthy_live_observations(load_script):
 
 Reset the streak for `inactive`, `bad`, `noData`, non-live lifecycle, dead child, or stale media. Simulate FFmpeg exit after `transition live` and assert `set-privacy` is never invoked.
 
-- [ ] **Step 3: Run focused tests and observe failure**
+- [x] **Step 3: Run focused tests and observe failure**
 
 Run:
 
@@ -459,7 +459,7 @@ Run:
 
 Expected: failures because the state machine and gate do not exist.
 
-- [ ] **Step 4: Implement the lifecycle loop**
+- [x] **Step 4: Implement the lifecycle loop**
 
 The loop order is exact:
 
@@ -477,15 +477,15 @@ The loop order is exact:
 
 An already-live event skips transitions. An already-public event is never demoted. Any pre-public failure retains the same unlisted ID. Any post-public source failure retains the same public ID.
 
-- [ ] **Step 5: Remove completion-on-exit behavior**
+- [x] **Step 5: Remove completion-on-exit behavior**
 
 Delete the `finally` call that completes a broadcast. Keep process cleanup only. Emit a deprecation log if `YTA_YOUTUBE_COMPLETE_ON_EXIT=true`; do not honor it in unattended lifecycle mode.
 
-- [ ] **Step 6: Persist classified backoff**
+- [x] **Step 6: Persist classified backoff**
 
 Use the helper's `set-retry` command before sleeping. Source/encoder errors use 10 seconds to 5 minutes; API errors use 30 seconds to 15 minutes; quota errors use 15 minutes to 6 hours; ambiguous states use 5 minutes to 1 hour. Apply full jitter in production and inject deterministic jitter in tests.
 
-- [ ] **Step 7: Run all tests and commit**
+- [x] **Step 7: Run all tests and commit**
 
 Run:
 
@@ -519,7 +519,7 @@ git commit -m "encoder: recover one broadcast and publish when healthy"
 - Consumes: Final Task 2-5 environment variables and CLI commands.
 - Produces: Deployable configuration, accurate recovery documentation, and a current changelog entry.
 
-- [ ] **Step 1: Update example configuration**
+- [x] **Step 1: Update example configuration**
 
 Document exact values:
 
@@ -534,15 +534,15 @@ YTA_YOUTUBE_COMPLETE_ON_EXIT=false
 
 Add retry base/max variables only when implemented as operator-tunable values; otherwise document fixed defaults in README.
 
-- [ ] **Step 2: Correct architecture and caveats**
+- [x] **Step 2: Correct architecture and caveats**
 
 Replace statements that each recovery creates a broadcast. Document exact marker adoption, terminal-only replacement, unlisted-to-public promotion, persistent backoff, explicit-only completion, and the intentional public-unavailable watch page during outages.
 
-- [ ] **Step 3: Add the current changelog entry**
+- [x] **Step 3: Add the current changelog entry**
 
 Add `2026-07-10 - Idempotent YouTube Lifecycle Recovery` to `CHANGELOG.md` and make it the only entry shown in README. Include FFmpeg option compatibility, duplicate prevention, persisted backoff, and public-after-live behavior.
 
-- [ ] **Step 4: Run documentation and repository checks**
+- [x] **Step 4: Run documentation and repository checks**
 
 Run:
 

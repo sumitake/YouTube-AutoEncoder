@@ -683,8 +683,6 @@ def reconcile_command_args() -> list[str]:
     title = os.environ.get("YTA_YOUTUBE_TITLE")
     if title:
         args.extend(["--title", title])
-    if bool_env("YTA_YOUTUBE_CREATE_STREAM", True):
-        args.append("--create-stream")
     return args
 
 

@@ -2,6 +2,14 @@
 
 All notable project changes are recorded here. The README shows only the most recent entry.
 
+## 2026-07-10 - Idempotent YouTube Lifecycle Recovery
+
+- Added durable instance and generation markers so one nonterminal broadcast is reconciled and reused across camera, FFmpeg, service, and host restarts.
+- Added write-ahead state, mutation and supervisor locks, structured API failures, persisted class-specific cooldowns, and fail-closed handling for ambiguous remote state.
+- Removed automatic broadcast completion and unconditional recreation from unattended recovery; only an explicit operator command can complete a confirmed live event.
+- Made FFmpeg RTSP options capability-aware, removed the incompatible default `-rw_timeout`, and added machine-readable media-progress supervision during API operations.
+- Added unlisted staging and verified public promotion only after two consecutive healthy live observations, while preserving the public watch URL through later outages.
+
 ## 2026-07-06 - Public Repository Hardening
 
 - Added GitHub Actions CI for Python 3.11, 3.12, and 3.13 with Ruff, py_compile, pytest, executable-bit checks, and systemd unit verification.
