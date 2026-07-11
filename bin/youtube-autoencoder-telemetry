@@ -59,6 +59,7 @@ VIDEO_TIMESTAMP_FIELDS = (
 )
 VIDEO_METRIC_FIELDS = ("concurrent_viewers", "view_count", "like_count", "comment_count")
 VIDEO_FIELDS = ("video_id", *VIDEO_TIMESTAMP_FIELDS, *VIDEO_METRIC_FIELDS)
+SAMPLE_CONTEXT_FIELDS = ("instance_id", "generation_id", "broadcast_id", "lifecycle", "privacy")
 REASON_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 DAILY_FILE_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})\.jsonl\Z")
 
@@ -117,7 +118,7 @@ def durable_json(path: pathlib.Path, data: dict[str, Any]) -> None:
 
 
 def telemetry_enabled() -> bool:
-    return os.environ.get("YTA_TELEMETRY_ENABLED") == "1"
+    return os.environ.get("YTA_TELEMETRY_ENABLED", "").casefold() in {"1", "true"}
 
 
 def telemetry_min_interval() -> int:
@@ -274,9 +275,9 @@ def append_jsonl(path: pathlib.Path, data: dict[str, Any]) -> None:
 
 def telemetry_retention_days() -> int:
     try:
-        configured = int(os.environ.get("YTA_TELEMETRY_RETENTION_DAYS", "7"))
+        configured = int(os.environ.get("YTA_TELEMETRY_RETENTION_DAYS", "30"))
     except ValueError:
-        configured = 1
+        configured = 30
     return max(1, configured)
 
 
@@ -302,10 +303,16 @@ def prune_daily_files(now: dt.datetime) -> None:
                 continue
 
 
-def sample_for(state: dict[str, Any], video: dict[str, Any], now: dt.datetime) -> dict[str, Any]:
-    context = {field: state.get(field) for field in ("instance_id", "generation_id", "broadcast_id", "lifecycle", "privacy")}
+def validate_sample_context(state: dict[str, Any]) -> dict[str, str]:
+    context = {field: state.get(field) for field in SAMPLE_CONTEXT_FIELDS}
     if not all(isinstance(value, str) and value for value in context.values()):
         raise TelemetryError("invalid lifecycle context")
+    if context["lifecycle"] != "live":
+        raise TelemetryError("invalid lifecycle context")
+    return context
+
+
+def sample_for(context: dict[str, str], video: dict[str, Any], now: dt.datetime) -> dict[str, Any]:
     return {"collected_at": utc_text(now), **context, "video": video}
 
 
@@ -326,12 +333,25 @@ def log_helper_error(error: HelperError) -> None:
     )
 
 
+def helper_error_status(error: HelperError) -> int:
+    return_code = error.return_code
+    if isinstance(return_code, int) and not isinstance(return_code, bool) and 1 <= return_code <= 255:
+        return return_code
+    return 1
+
+
+def log_skip(reason: str) -> None:
+    print(json.dumps({"skip_reason": reason}, sort_keys=True), file=sys.stderr, flush=True)
+
+
 def collect_once(now: dt.datetime | None = None) -> int:
     if not telemetry_enabled():
+        log_skip("disabled")
         return 0
     current = now or dt.datetime.now(dt.UTC)
     current = current.astimezone(dt.UTC)
     if not LIFECYCLE_FILE.exists():
+        log_skip("missing_lifecycle")
         return 0
     try:
         state = read_json(LIFECYCLE_FILE)
@@ -339,26 +359,31 @@ def collect_once(now: dt.datetime | None = None) -> int:
     except TelemetryError:
         return 1
     if not eligible:
+        log_skip(_reason)
         return 0
     try:
         with telemetry_lock() as acquired:
             if not acquired:
+                log_skip("lock_held")
                 return 0
             if not LIFECYCLE_FILE.exists():
+                log_skip("missing_lifecycle")
                 return 0
             state = read_json(LIFECYCLE_FILE)
             collector_state = read_collector_state()
             eligible, _reason = eligibility(state, collector_state, current)
             if not eligible:
+                log_skip(_reason)
                 return 0
+            context = validate_sample_context(state)
             collector_state["last_attempt_at"] = utc_text(current)
             durable_json(TELEMETRY_DIR / "collector-state.json", collector_state)
             try:
                 video = invoke_video_metrics(state["broadcast_id"])
             except HelperError as exc:
                 log_helper_error(exc)
-                return 1
-            sample = sample_for(state, video, current)
+                return helper_error_status(exc)
+            sample = sample_for(context, video, current)
             append_jsonl(TELEMETRY_DIR / f"{current:%Y-%m-%d}.jsonl", sample)
             durable_json(TELEMETRY_DIR / "latest.json", sample)
             collector_state["last_success_at"] = utc_text(current)

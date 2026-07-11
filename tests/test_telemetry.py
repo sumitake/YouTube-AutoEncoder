@@ -50,7 +50,28 @@ def successful_helper(payload):
     return types.SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
 
-def test_disabled_collector_has_no_files_or_subprocess(load_script, monkeypatch, tmp_path):
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "TrUe"])
+def test_enable_flag_accepts_true_case_insensitively_and_legacy_one(load_script, monkeypatch, value):
+    telemetry = load_script("youtube-autoencoder-telemetry", f"yta_telemetry_enabled_{value}")
+    monkeypatch.setenv("YTA_TELEMETRY_ENABLED", value)
+
+    assert telemetry.telemetry_enabled() is True
+
+
+@pytest.mark.parametrize("value", [None, "false", "0", "yes", "enabled", ""])
+def test_enable_flag_rejects_unset_false_zero_and_unrelated_values(load_script, monkeypatch, value):
+    telemetry = load_script("youtube-autoencoder-telemetry", f"yta_telemetry_disabled_{value}")
+    if value is None:
+        monkeypatch.delenv("YTA_TELEMETRY_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("YTA_TELEMETRY_ENABLED", value)
+
+    assert telemetry.telemetry_enabled() is False
+
+
+def test_disabled_collector_has_no_files_subprocess_and_logs_skip_reason(
+    load_script, monkeypatch, tmp_path, capsys
+):
     telemetry = load_script("youtube-autoencoder-telemetry", "yta_telemetry_disabled")
     monkeypatch.delenv("YTA_TELEMETRY_ENABLED", raising=False)
     monkeypatch.setattr(telemetry, "TELEMETRY_DIR", tmp_path / "telemetry")
@@ -62,6 +83,7 @@ def test_disabled_collector_has_no_files_or_subprocess(load_script, monkeypatch,
 
     assert telemetry.collect_once() == 0
     assert not telemetry.TELEMETRY_DIR.exists()
+    assert json.loads(capsys.readouterr().err) == {"skip_reason": "disabled"}
 
 
 def test_missing_lifecycle_state_skips_before_storage_or_helper(load_script, monkeypatch, tmp_path):
@@ -104,6 +126,20 @@ def test_locally_ineligible_collector_skips_before_storage_or_helper(load_script
 
     assert telemetry.collect_once() == 0
     assert not telemetry.TELEMETRY_DIR.exists()
+
+
+def test_lifecycle_ineligible_exit_logs_fixed_skip_reason(load_script, monkeypatch, tmp_path, capsys):
+    telemetry = load_script("youtube-autoencoder-telemetry", "yta_telemetry_non_live_skip_reason")
+    configure_collector(telemetry, monkeypatch, tmp_path, {"lifecycle": "ready", "broadcast_id": "video-1"})
+    monkeypatch.setattr(
+        telemetry.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("ineligible telemetry invoked helper"),
+    )
+
+    assert telemetry.collect_once(NOW) == 0
+    assert not telemetry.TELEMETRY_DIR.exists()
+    assert json.loads(capsys.readouterr().err) == {"skip_reason": "not_live"}
 
 
 def test_telemetry_minimum_interval_clamps_to_five_minutes(load_script, monkeypatch):
@@ -180,6 +216,38 @@ def test_held_nonblocking_lock_skips_cleanly(load_script, monkeypatch, tmp_path)
     with telemetry.telemetry_lock() as acquired:
         assert acquired is True
         assert telemetry.collect_once(NOW) == 0
+
+
+MISSING = object()
+
+
+@pytest.mark.parametrize("field", ["instance_id", "generation_id", "privacy"])
+@pytest.mark.parametrize(
+    ("value", "case"),
+    [(MISSING, "missing"), ("", "empty"), (False, "bool"), (7, "non_string")],
+)
+def test_invalid_sample_context_fails_before_attempt_or_helper(
+    load_script, monkeypatch, tmp_path, field, value, case
+):
+    telemetry = load_script("youtube-autoencoder-telemetry", f"yta_telemetry_invalid_context_{field}_{case}")
+    state = live_state()
+    if value is MISSING:
+        state.pop(field)
+    else:
+        state[field] = value
+    configure_collector(telemetry, monkeypatch, tmp_path, state)
+    helper_calls = []
+
+    def fake_run(*_args, **_kwargs):
+        helper_calls.append(True)
+        return successful_helper(helper_payload())
+
+    monkeypatch.setattr(telemetry.subprocess, "run", fake_run)
+
+    assert telemetry.collect_once(NOW) == 1
+    assert helper_calls == []
+    assert not (telemetry.TELEMETRY_DIR / "collector-state.json").exists()
+    assert not (telemetry.TELEMETRY_DIR / "latest.json").exists()
 
 
 def test_video_metrics_helper_invocation_is_bounded_and_argument_safe(load_script, monkeypatch):
@@ -259,7 +327,7 @@ def test_successful_collection_persists_one_private_sample(load_script, monkeypa
 
 
 @pytest.mark.parametrize(
-    ("result", "expected_log"),
+    ("result", "expected_status", "expected_log"),
     [
         (
             types.SimpleNamespace(
@@ -267,6 +335,7 @@ def test_successful_collection_persists_one_private_sample(load_script, monkeypa
                 stdout="ignored output",
                 stderr=json.dumps({"retry_class": "quota", "http_status": 403, "reasons": ["quotaExceeded"]}),
             ),
+            75,
             {
                 "operation": "video-metrics",
                 "return_code": 75,
@@ -277,6 +346,7 @@ def test_successful_collection_persists_one_private_sample(load_script, monkeypa
         ),
         (
             subprocess.TimeoutExpired(["helper"], 45, output="ignored", stderr="ignored"),
+            1,
             {
                 "operation": "video-metrics",
                 "return_code": None,
@@ -287,6 +357,7 @@ def test_successful_collection_persists_one_private_sample(load_script, monkeypa
         ),
         (
             successful_helper({"not": "metrics"}),
+            1,
             {
                 "operation": "video-metrics",
                 "return_code": None,
@@ -295,10 +366,27 @@ def test_successful_collection_persists_one_private_sample(load_script, monkeypa
                 "reasons": ["invalid_payload"],
             },
         ),
+        (
+            types.SimpleNamespace(
+                returncode=-9,
+                stdout="ignored output",
+                stderr=json.dumps({"retry_class": "fatal", "http_status": None, "reasons": ["signal"]}),
+            ),
+            1,
+            {
+                "operation": "video-metrics",
+                "return_code": -9,
+                "retry_class": "fatal",
+                "http_status": None,
+                "reasons": ["signal"],
+            },
+        ),
     ],
-    ids=["nonzero", "timeout", "malformed_json"],
+    ids=["nonzero", "timeout", "malformed_json", "negative_signal"],
 )
-def test_helper_failures_preserve_attempt_without_latest(load_script, monkeypatch, tmp_path, capsys, result, expected_log):
+def test_helper_status_and_failures_preserve_attempt_without_latest(
+    load_script, monkeypatch, tmp_path, capsys, result, expected_status, expected_log
+):
     telemetry = load_script("youtube-autoencoder-telemetry", "yta_telemetry_helper_failure")
     configure_collector(telemetry, monkeypatch, tmp_path, live_state())
 
@@ -309,7 +397,7 @@ def test_helper_failures_preserve_attempt_without_latest(load_script, monkeypatc
 
     monkeypatch.setattr(telemetry.subprocess, "run", fake_run)
 
-    assert telemetry.collect_once(NOW) == 1
+    assert telemetry.collect_once(NOW) == expected_status
     assert not (telemetry.TELEMETRY_DIR / "latest.json").exists()
     state = json.loads((telemetry.TELEMETRY_DIR / "collector-state.json").read_text(encoding="utf-8"))
     assert state == {"last_attempt_at": "2026-07-10T12:00:00Z"}
@@ -349,7 +437,7 @@ def test_helper_failure_log_is_structured_and_sanitized(load_script, monkeypatch
         ),
     )
 
-    assert telemetry.collect_once(NOW) == 1
+    assert telemetry.collect_once(NOW) == 75
 
     logged = json.loads(capsys.readouterr().err)
     assert logged == {
@@ -405,3 +493,25 @@ def test_retention_clamps_to_current_utc_day(load_script, monkeypatch, tmp_path)
 
     assert not previous.exists()
     assert current.exists()
+
+
+def test_retention_days_defaults_to_thirty(load_script, monkeypatch):
+    telemetry = load_script("youtube-autoencoder-telemetry", "yta_telemetry_retention_days_default")
+    monkeypatch.delenv("YTA_TELEMETRY_RETENTION_DAYS", raising=False)
+
+    assert telemetry.telemetry_retention_days() == 30
+
+
+def test_retention_days_invalid_text_falls_back_to_thirty(load_script, monkeypatch):
+    telemetry = load_script("youtube-autoencoder-telemetry", "yta_telemetry_retention_days_invalid")
+    monkeypatch.setenv("YTA_TELEMETRY_RETENTION_DAYS", "invalid")
+
+    assert telemetry.telemetry_retention_days() == 30
+
+
+@pytest.mark.parametrize("value", ["0", "-7"])
+def test_retention_days_numeric_values_below_one_clamp_to_one(load_script, monkeypatch, value):
+    telemetry = load_script("youtube-autoencoder-telemetry", f"yta_telemetry_retention_days_clamp_{value}")
+    monkeypatch.setenv("YTA_TELEMETRY_RETENTION_DAYS", value)
+
+    assert telemetry.telemetry_retention_days() == 1
