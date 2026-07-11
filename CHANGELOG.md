@@ -6,7 +6,7 @@ All notable project changes are recorded here. The README shows only the most re
 
 - Reordered recovery so one marked unlisted broadcast is reconciled, created if needed, and bound before FFmpeg starts ingest.
 - Added fail-closed detection for unmarked recoverable broadcasts bound to the reusable stream, preventing unintended legacy auto-start events.
-- Reused the prepared lifecycle state after ingest becomes active to avoid a redundant reconciliation pass.
+- Reused the prepared lifecycle state after ingest becomes active, while revalidating cached public events and reconciling a replacement when YouTube confirms the cached event is terminal, missing, or rebound.
 - Added redacted API operation, HTTP status, and structured reason details to supervisor failures for actionable quota diagnostics.
 - Added regression coverage for offline staging, insert and bind partial failures, stable generation reuse, public-stream fallback, and CLI gating.
 

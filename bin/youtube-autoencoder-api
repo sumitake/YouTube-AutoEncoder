@@ -86,6 +86,10 @@ class ReconciliationError(RuntimeError):
     retry_class = "ambiguous"
 
 
+class RemoteBroadcastStateError(ReconciliationError):
+    public_fallback_allowed = False
+
+
 def log(message: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {message}", file=sys.stderr, flush=True)
 
@@ -185,7 +189,7 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
             "retry_class": exc.retry_class,
         }
     retry_class = str(getattr(exc, "retry_class", "fatal"))
-    return {
+    payload = {
         "error": True,
         "http_status": None,
         "message": str(exc),
@@ -193,6 +197,9 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
         "retry_after": None,
         "retry_class": retry_class,
     }
+    if getattr(exc, "public_fallback_allowed", True) is False:
+        payload["public_fallback_allowed"] = False
+    return payload
 
 
 def client_config() -> dict[str, str]:
@@ -845,7 +852,7 @@ def broadcast_status_payload(broadcast: dict[str, Any]) -> dict[str, Any]:
 def broadcast_status(broadcast_id: str) -> dict[str, Any]:
     broadcast = broadcast_by_id(broadcast_id)
     if broadcast is None:
-        raise ReconciliationError(f"liveBroadcast not found: {broadcast_id}")
+        raise RemoteBroadcastStateError(f"liveBroadcast not found: {broadcast_id}")
     return broadcast_status_payload(broadcast)
 
 

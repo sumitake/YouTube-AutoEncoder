@@ -804,6 +804,18 @@ def test_set_privacy_command_reuses_verified_readback(load_script, monkeypatch, 
     assert output["privacy"] == "public"
 
 
+def test_missing_broadcast_status_disables_cached_public_fallback(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_missing_broadcast_status")
+    monkeypatch.setattr(api, "broadcast_by_id", lambda _broadcast_id: None)
+
+    with pytest.raises(api.ReconciliationError, match="not found") as raised:
+        api.broadcast_status("missing-broadcast")
+
+    payload = api.error_payload(raised.value)
+    assert payload["retry_class"] == "ambiguous"
+    assert payload["public_fallback_allowed"] is False
+
+
 def test_retry_state_updates_preserve_broadcast_identity(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_retry_state")
     configure_reconciliation(api, monkeypatch, tmp_path)

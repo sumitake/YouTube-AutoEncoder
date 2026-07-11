@@ -429,7 +429,7 @@ Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full 
 
 ### 2026-07-11 - Pre-Ingest Broadcast Staging
 
-- Stages and binds one marked unlisted event before FFmpeg ingest, blocks unmarked bound conflicts, and logs structured API operation and rate-limit details without exposing credentials.
+- Stages and binds one marked unlisted event before FFmpeg ingest, blocks unmarked bound conflicts, revalidates cached public events after ingest, and logs structured API operation and rate-limit details without exposing credentials.
 
 ## Repository Layout
 

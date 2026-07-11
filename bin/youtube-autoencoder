@@ -83,6 +83,7 @@ class ApiCommandError(RuntimeError):
         self.http_status = self.payload.get("http_status")
         self.reasons = tuple(str(reason) for reason in self.payload.get("reasons") or [])
         self.retry_class = str(self.payload.get("retry_class") or "fatal")
+        self.public_fallback_allowed = self.payload.get("public_fallback_allowed") is not False
         retry_after = self.payload.get("retry_after")
         try:
             self.retry_after = float(retry_after) if retry_after is not None else None
@@ -694,6 +695,7 @@ def current_observation(runtime: StreamRuntime, state: dict[str, Any]) -> dict[s
             payload={
                 "message": f"managed broadcast is bound to a different stream: {bound_stream_id or '<empty>'}",
                 "retry_class": "ambiguous",
+                "public_fallback_allowed": False,
             },
         )
     ensure_encoder_running(runtime)
@@ -830,11 +832,12 @@ def manage_youtube_lifecycle(
     prepared_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     active_stream = wait_for_active_stream(runtime)
-    state = (
-        dict(prepared_state)
-        if prepared_state is not None
-        else api_command_while_streaming(reconcile_command_args(), runtime, timeout=120)
-    )
+    if prepared_state is None:
+        state = api_command_while_streaming(reconcile_command_args(), runtime, timeout=120)
+    else:
+        state = dict(prepared_state)
+        if verified_public_state(state):
+            state = revalidate_public_state(runtime, state)
     stream_id = str(state.get("stream_id") or state.get("last_stream_id") or "")
     broadcast_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
     if not stream_id or not broadcast_id:
@@ -863,11 +866,50 @@ def verified_public_state(state: dict[str, Any]) -> bool:
     return lifecycle == "live" and privacy == "public" and bool(stream_id and broadcast_id)
 
 
+def disable_public_fallback(error: ApiCommandError) -> ApiCommandError:
+    payload = dict(error.payload)
+    payload["public_fallback_allowed"] = False
+    return ApiCommandError(
+        returncode=error.returncode,
+        operation=error.operation,
+        payload=payload,
+    )
+
+
+def reconcile_invalid_public_state(runtime: StreamRuntime) -> dict[str, Any]:
+    try:
+        return api_command_while_streaming(reconcile_command_args(), runtime, timeout=120)
+    except ApiCommandError as error:
+        raise disable_public_fallback(error) from error
+
+
+def revalidate_public_state(runtime: StreamRuntime, state: dict[str, Any]) -> dict[str, Any]:
+    try:
+        observation = current_observation(runtime, state)
+    except ApiCommandError as error:
+        if error.public_fallback_allowed:
+            raise
+        log("cached public broadcast is no longer recoverable; reconciling replacement")
+        return reconcile_invalid_public_state(runtime)
+
+    if observation.get("lifecycle") == "live" and observation.get("privacy") == "public":
+        refreshed = dict(state)
+        refreshed["lifecycle"] = "live"
+        refreshed["privacy"] = "public"
+        return refreshed
+
+    log(
+        "cached public broadcast is no longer live/public; reconciling replacement "
+        f"lifecycle={observation.get('lifecycle')} privacy={observation.get('privacy')}"
+    )
+    return reconcile_invalid_public_state(runtime)
+
+
 def manage_with_public_fallback(runtime: StreamRuntime, cached_state: dict[str, Any]) -> dict[str, Any]:
     try:
         return manage_youtube_lifecycle(runtime, prepared_state=cached_state)
     except ApiCommandError as error:
-        if not verified_public_state(cached_state):
+        if not verified_public_state(cached_state) or not error.public_fallback_allowed:
             raise
         ensure_encoder_running(runtime)
         retry_class = classify_api_error(error)
