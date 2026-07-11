@@ -29,14 +29,16 @@ The intended outcome is an appliance-like encoder that can be deployed on a Rasp
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph ArchitectureInputs["Source and compatibility inputs"]
+        direction LR
         Camera["RTSP camera"]
         ObsScene["Optional OBS scene"]
         ObsService["Optional OBS service profile"]
     end
 
     subgraph ArchitectureHost["Encoder host"]
+        direction TB
         Systemd["systemd service"]
         Supervisor["youtube-autoencoder supervisor"]
         Probe["FFprobe source validation"]
@@ -47,6 +49,7 @@ flowchart LR
     end
 
     subgraph ArchitectureYouTube["YouTube"]
+        direction LR
         Ingest["Reusable liveStream ingest"]
         Api["YouTube Data API v3"]
         Broadcast["One marked liveBroadcast and watch page"]
@@ -134,41 +137,34 @@ Every recovery path first preserves ownership and retry state. Media must be fre
 ```mermaid
 stateDiagram-v2
     state "Startup or restart" as RecoveryStartup
-    state "Retry deadline pending" as RecoveryWait
-    state "Probe camera source" as RecoveryProbe
-    state "Start and supervise FFmpeg" as RecoveryEncoder
-    state "Wait for active ingest" as RecoveryIngest
-    state "Reconcile marked broadcast" as RecoveryReconcile
-    state "Resume same event" as RecoveryResume
-    state "Create unlisted generation" as RecoveryCreate
-    state "Testing, live, and health gates" as RecoveryGates
-    state "Verified public stream" as RecoveryStable
-    state "Persist source cooldown" as RecoverySourceBackoff
-    state "Persist API, quota, or ambiguity cooldown" as RecoveryControlBackoff
-    state "Prior event terminal or missing" as RecoveryTerminal
+    state "Managed stream generation" as RecoveryGeneration {
+        state "Probe source and start FFmpeg" as RecoveryMedia
+        state "Require fresh active ingest" as RecoveryIngest
+        state "Reconcile exact ownership markers" as RecoveryReconcile
+        state "Create and bind unlisted generation" as RecoveryCreate
+        state "Resume one nonterminal event" as RecoveryManaged
+        state "Testing, live, and publication gates" as RecoveryGates
+        state "Verified public stream" as RecoveryStable
+        state "Public stream with API cooldown" as RecoveryPublicFallback
+
+        [*] --> RecoveryMedia
+        RecoveryMedia --> RecoveryIngest : media progress fresh
+        RecoveryIngest --> RecoveryReconcile : YouTube ingest active
+        RecoveryReconcile --> RecoveryManaged : one marked nonterminal event
+        RecoveryReconcile --> RecoveryCreate : none, terminal, or missing
+        RecoveryCreate --> RecoveryManaged : insert and bind verified
+        RecoveryManaged --> RecoveryGates
+        RecoveryGates --> RecoveryStable : two healthy live observations and privacy readback
+        RecoveryStable --> RecoveryPublicFallback : API unavailable, media healthy
+        RecoveryPublicFallback --> RecoveryStable : API recovers
+    }
+    state "Persist classified cooldown" as RecoveryBackoff
 
     [*] --> RecoveryStartup
-    RecoveryStartup --> RecoveryWait : deadline still active
-    RecoveryWait --> RecoveryStartup : deadline expires or host restarts
-    RecoveryStartup --> RecoveryProbe : no active deadline
-    RecoveryProbe --> RecoverySourceBackoff : source unavailable
-    RecoverySourceBackoff --> RecoveryWait
-    RecoveryProbe --> RecoveryEncoder : source available
-    RecoveryEncoder --> RecoveryIngest
-    RecoveryIngest --> RecoverySourceBackoff : media stops or ingest stays inactive
-    RecoveryIngest --> RecoveryReconcile : media fresh and ingest active
-    RecoveryReconcile --> RecoveryResume : one marked nonterminal event
-    RecoveryReconcile --> RecoveryCreate : no recoverable event
-    RecoveryReconcile --> RecoveryControlBackoff : API, quota, or ambiguous state
-    RecoveryCreate --> RecoveryResume : insert and bind verified
-    RecoveryResume --> RecoveryGates
-    RecoveryGates --> RecoveryStable : two healthy live observations and privacy readback
-    RecoveryResume --> RecoverySourceBackoff : camera or FFmpeg interruption
-    RecoveryGates --> RecoveryControlBackoff : control-plane failure before public verification
-    RecoveryControlBackoff --> RecoveryWait
-    RecoveryStable --> RecoveryResume : media path recovers with the same watch URL
-    RecoveryResume --> RecoveryTerminal : YouTube confirms terminal or missing
-    RecoveryTerminal --> RecoveryCreate : next generation only
+    RecoveryStartup --> RecoveryBackoff : retry deadline active
+    RecoveryBackoff --> RecoveryStartup : deadline expires or host restarts
+    RecoveryStartup --> RecoveryGeneration : no active deadline
+    RecoveryGeneration --> RecoveryBackoff : recoverable failure, preserve ownership
 ```
 
 | Failure | Expected behavior |

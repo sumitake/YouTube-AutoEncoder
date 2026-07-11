@@ -35,7 +35,7 @@ The README remains an executive and operational entry point. Detailed algorithms
 
 Placement: replace the existing text diagram at the start of `## Architecture`.
 
-Format: Mermaid `flowchart LR` with three visually distinct logical regions:
+Format: Mermaid `flowchart TB` with three visually distinct logical regions:
 
 1. Sources and compatibility inputs: RTSP camera, optional OBS scene, and optional OBS service profile.
 2. Encoder host: systemd, supervisor, FFprobe, FFmpeg, API helper, durable state and locks, and OAuth files.
@@ -68,6 +68,8 @@ Format: Mermaid `stateDiagram-v2` focused on recovery decisions:
 - A verified public stream stops nonessential API polling while FFmpeg remains supervised.
 
 The state machine may name the testing/live/public gates only where necessary to show recovery destinations. It will not become the omitted normal-production lifecycle diagram.
+
+For README readability, healthy progression is grouped inside one managed-generation composite state. Classified failures share one transition into the durable cooldown state; the existing failure table remains authoritative for the per-failure behavior.
 
 ### 3. Provisioning And Deployment Flow
 
