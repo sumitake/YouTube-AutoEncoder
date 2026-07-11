@@ -231,7 +231,7 @@ If camera, FFmpeg, service, or Pi fails after publication, do not complete or re
 
 ### API Failure During Stable Streaming
 
-When the cached and previously verified state is live, an API timeout or rate-limit error does not stop a healthy FFmpeg process. Nonessential API calls pause until backoff expires. Mutations remain disabled until remote state can be reconciled.
+Every new FFmpeg session requires successful pre-ingest ownership and binding reconciliation, even when the cache says the prior event was live and public. An API timeout or rate-limit error before FFmpeg starts therefore fails closed under persisted backoff. After that reconciliation succeeds and healthy public ingest is already active, a later API failure does not stop FFmpeg; nonessential API calls pause until backoff expires and mutations remain disabled until remote state can be reconciled.
 
 ### Explicit Completion
 

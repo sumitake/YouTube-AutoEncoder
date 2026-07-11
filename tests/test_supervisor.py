@@ -906,21 +906,57 @@ def test_nonpublic_state_is_staged_before_ffmpeg_starts(load_script, monkeypatch
     assert events[2] == ("manage", prepared)
 
 
-def test_verified_public_state_skips_preingest_api_staging(load_script, monkeypatch):
-    supervisor = load_script("youtube-autoencoder", "yta_public_preingest_skip")
+def test_verified_public_state_runs_preingest_conflict_check(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_public_preingest_check")
+    calls = []
     cached = {
         "stream_id": "stream-1",
         "broadcast_id": "broadcast-1",
         "lifecycle": "live",
         "privacy": "public",
     }
+
+    def command(args, timeout):
+        calls.append((args, timeout))
+        return cached
+
+    monkeypatch.setattr(supervisor, "api_command", command)
+
+    assert supervisor.prepare_youtube_lifecycle(cached) == cached
+    assert calls[0][0][0] == "reconcile-broadcast"
+    assert "--offline-create" in calls[0][0]
+    assert calls[0][1] == 120
+
+
+def test_preingest_api_failure_prevents_ffmpeg_start(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_preingest_failure_no_ffmpeg")
+    cached = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "live",
+        "privacy": "public",
+    }
+    failure = supervisor.ApiCommandError(
+        returncode=75,
+        payload={"message": "rate limited", "retry_class": "quota"},
+    )
+    monkeypatch.setattr(supervisor, "stream_config", lambda: ("rtsp://camera/stream", "rtmps://youtube/live/key"))
+    monkeypatch.setattr(supervisor, "source_available", lambda _url: True)
     monkeypatch.setattr(
         supervisor,
         "api_command",
-        lambda *_args, **_kwargs: pytest.fail("public recovery was blocked on the API"),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("FFmpeg started before lifecycle reconciliation"),
     )
 
-    assert supervisor.prepare_youtube_lifecycle(cached) == cached
+    with pytest.raises(supervisor.ApiCommandError) as raised:
+        supervisor.run_once(cached_state=cached)
+
+    assert raised.value is failure
 
 
 def test_legacy_public_privacy_never_changes_staging_default(load_script, monkeypatch):

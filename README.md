@@ -89,7 +89,7 @@ OBS compatibility mode can also read and update:
 
 ### Recovery Behavior
 
-Every recovery path first preserves ownership and retry state. A passing source probe permits one marked unlisted event to be staged before ingest. Fresh media and active YouTube ingest remain mandatory before `testing`, `live`, or public promotion.
+Every recovery path first preserves ownership and retry state. After a passing source probe, the YouTube control plane must reconcile ownership and binding before FFmpeg starts, including for cached public state. Fresh media and active YouTube ingest remain mandatory before `testing`, `live`, or public promotion.
 
 See the [recovery state machine](docs/architecture-and-flows.md#recovery-state-machine) for startup, managed-generation, and durable-cooldown transitions.
 
@@ -100,7 +100,8 @@ See the [recovery state machine](docs/architecture-and-flows.md#recovery-state-m
 | Host reboots | systemd restarts the service, the durable cache is reconciled, and the same nonterminal event resumes. |
 | FFmpeg exits or stalls | The child and any in-flight API helper stop; the same event is retained for retry. |
 | YouTube ingest does not become active | The single staged unlisted event is retained; no transition or publication occurs. |
-| YouTube API rate limit or outage | The retry class and deadline persist. A previously verified public stream can continue without control-plane mutation. |
+| YouTube API rate limit or outage before FFmpeg starts | Startup fails closed, no ingest begins, and the retry class and deadline persist. |
+| YouTube API rate limit or outage after validated public ingest is active | The already-running public stream can continue without control-plane mutation. |
 | Unmarked event is bound to the reusable stream | Reconciliation fails closed before FFmpeg starts, preventing an unintended legacy auto-start. |
 | Ambiguous or unknown remote state | Reconciliation fails closed and creates nothing until the ambiguity is resolved. |
 | OAuth access token expires | API helper refreshes from the stored refresh token. |
@@ -429,7 +430,7 @@ Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full 
 
 ### 2026-07-11 - Pre-Ingest Broadcast Staging
 
-- Stages and binds one marked unlisted event before FFmpeg ingest, blocks unmarked bound conflicts, revalidates cached public events after ingest, and logs structured API operation and rate-limit details without exposing credentials.
+- Reconciles every startup before FFmpeg ingest, stages and binds one marked unlisted event when needed, blocks unmarked bound conflicts, revalidates cached public events after ingest, and logs structured API operation and rate-limit details without exposing credentials.
 
 ## Repository Layout
 

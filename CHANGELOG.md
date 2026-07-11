@@ -4,7 +4,7 @@ All notable project changes are recorded here. The README shows only the most re
 
 ## 2026-07-11 - Pre-Ingest Broadcast Staging
 
-- Reordered recovery so one marked unlisted broadcast is reconciled, created if needed, and bound before FFmpeg starts ingest.
+- Reordered every recovery, including cached public state, so one marked broadcast is reconciled, created unlisted if needed, and bound before FFmpeg starts ingest; startup API failures now fail closed.
 - Added fail-closed detection for unmarked recoverable broadcasts bound to the reusable stream, preventing unintended legacy auto-start events.
 - Reused the prepared lifecycle state after ingest becomes active, while revalidating cached public events and reconciling a replacement when YouTube confirms the cached event is terminal, missing, or rebound.
 - Added redacted API operation, HTTP status, and structured reason details to supervisor failures for actionable quota diagnostics.

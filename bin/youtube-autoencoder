@@ -998,7 +998,7 @@ def read_recovery_state() -> dict[str, Any]:
 
 
 def prepare_youtube_lifecycle(cached_state: dict[str, Any]) -> dict[str, Any]:
-    if not lifecycle_enabled() or verified_public_state(cached_state):
+    if not lifecycle_enabled():
         return dict(cached_state)
     return api_command(reconcile_command_args(offline_create=True), timeout=120)
 
