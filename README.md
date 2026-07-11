@@ -268,7 +268,6 @@ Install the system service for a dedicated user named `encoder`:
 ```bash
 sudo install -m 0644 systemd/youtube-autoencoder@.service /etc/systemd/system/youtube-autoencoder@.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now youtube-autoencoder@encoder.service
 ```
 
 For a user service instead:
@@ -277,8 +276,9 @@ For a user service instead:
 mkdir -p ~/.config/systemd/user
 cp systemd/user/youtube-autoencoder.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now youtube-autoencoder.service
 ```
+
+The unit is installed but deliberately left disabled until OAuth, source, ingest, and visible-stream validation succeed.
 
 For Raspberry Pi specific notes, see `docs/raspberry-pi.md`.
 
@@ -449,6 +449,20 @@ YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
 ```
 
 This validates OAuth, reusable-stream provisioning, idempotent broadcast reconciliation, stream binding, ingest detection, transitions to `testing` and `live`, and explicit completion. The normal unattended service never completes on exit.
+
+### 8. Enable the Service
+
+After visible validation succeeds, enable the system service:
+
+```bash
+sudo systemctl enable --now youtube-autoencoder@encoder.service
+```
+
+For a user service instead:
+
+```bash
+systemctl --user enable --now youtube-autoencoder.service
+```
 
 ### Common Authorization Problems
 

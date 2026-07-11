@@ -97,6 +97,8 @@ Decision nodes will identify the two operator-significant branches:
 
 The detailed README text will state that `--create-stream` requires an existing writable OBS service file with a non-empty placeholder key. A validation failure returns to the reusable-stream decision so provisioning is retried when the prior attempt did not create a stream.
 
+Command-level instructions must follow the same order as the diagram: install the systemd unit during host setup, but do not enable or start it until OAuth, source, ingest, and visible-stream validation have succeeded.
+
 The existing numbered OAuth section remains the source of command and console detail.
 
 ## Mermaid Conventions

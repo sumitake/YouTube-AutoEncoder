@@ -267,7 +267,11 @@ flowchart TD
 ```
 ````
 
-- [ ] **Step 3: Validate the approved diagram count and deployment branches**
+- [ ] **Step 3: Align service activation with successful validation**
+
+Remove both `enable --now` commands from the initial unit-install examples. State that the units remain disabled during provisioning, then add a post-validation section that enables either the system or user service only after the visible test succeeds.
+
+- [ ] **Step 4: Validate the approved diagram count and deployment branches**
 
 Run:
 
@@ -277,12 +281,13 @@ test "$(rg -c '^flowchart TB$' README.md)" -eq 1
 test "$(rg -c '^flowchart TD$' README.md)" -eq 1
 test "$(rg -c '^stateDiagram-v2$' README.md)" -eq 1
 rg -n 'DeploymentStreamDecision|DeploymentValidationDecision|DeploymentDiagnose --> DeploymentStreamDecision|remote-management recovery' README.md
+rg -n 'left disabled|### 8\. Enable the Service|enable --now youtube-autoencoder' README.md
 git diff --check
 ```
 
 Expected: exactly three approved Mermaid blocks, exactly one of each diagram type, both decision IDs found, and zero diff-check errors.
 
-- [ ] **Step 4: Commit the deployment flow**
+- [ ] **Step 5: Commit the deployment flow**
 
 ```bash
 git add README.md
