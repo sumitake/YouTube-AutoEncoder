@@ -129,6 +129,48 @@ OBS compatibility mode can also read and update:
 
 ### Recovery Behavior
 
+Every recovery path first preserves ownership and retry state. Media must be fresh and YouTube ingest active before reconciliation can create or transition anything.
+
+```mermaid
+stateDiagram-v2
+    state "Startup or restart" as RecoveryStartup
+    state "Retry deadline pending" as RecoveryWait
+    state "Probe camera source" as RecoveryProbe
+    state "Start and supervise FFmpeg" as RecoveryEncoder
+    state "Wait for active ingest" as RecoveryIngest
+    state "Reconcile marked broadcast" as RecoveryReconcile
+    state "Resume same event" as RecoveryResume
+    state "Create unlisted generation" as RecoveryCreate
+    state "Testing, live, and health gates" as RecoveryGates
+    state "Verified public stream" as RecoveryStable
+    state "Persist source cooldown" as RecoverySourceBackoff
+    state "Persist API, quota, or ambiguity cooldown" as RecoveryControlBackoff
+    state "Prior event terminal or missing" as RecoveryTerminal
+
+    [*] --> RecoveryStartup
+    RecoveryStartup --> RecoveryWait : deadline still active
+    RecoveryWait --> RecoveryStartup : deadline expires or host restarts
+    RecoveryStartup --> RecoveryProbe : no active deadline
+    RecoveryProbe --> RecoverySourceBackoff : source unavailable
+    RecoverySourceBackoff --> RecoveryWait
+    RecoveryProbe --> RecoveryEncoder : source available
+    RecoveryEncoder --> RecoveryIngest
+    RecoveryIngest --> RecoverySourceBackoff : media stops or ingest stays inactive
+    RecoveryIngest --> RecoveryReconcile : media fresh and ingest active
+    RecoveryReconcile --> RecoveryResume : one marked nonterminal event
+    RecoveryReconcile --> RecoveryCreate : no recoverable event
+    RecoveryReconcile --> RecoveryControlBackoff : API, quota, or ambiguous state
+    RecoveryCreate --> RecoveryResume : insert and bind verified
+    RecoveryResume --> RecoveryGates
+    RecoveryGates --> RecoveryStable : two healthy live observations and privacy readback
+    RecoveryResume --> RecoverySourceBackoff : camera or FFmpeg interruption
+    RecoveryGates --> RecoveryControlBackoff : control-plane failure before public verification
+    RecoveryControlBackoff --> RecoveryWait
+    RecoveryStable --> RecoveryResume : media path recovers with the same watch URL
+    RecoveryResume --> RecoveryTerminal : YouTube confirms terminal or missing
+    RecoveryTerminal --> RecoveryCreate : next generation only
+```
+
 | Failure | Expected behavior |
 | --- | --- |
 | Camera offline before stream start | Source probe fails; no new broadcast is created; source backoff is persisted. |
