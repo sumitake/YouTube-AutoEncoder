@@ -171,17 +171,17 @@ sudo install -m 0755 bin/youtube-autoencoder-test-pattern /usr/local/bin/youtube
 sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-autoencoder-telemetry
 ```
 
-Create a config directory for the service user:
+For a system service, create the dedicated account if it does not already exist:
 
 ```bash
-mkdir -p ~/.config/youtube-autoencoder
-cp config/youtube-autoencoder.env.example ~/.config/youtube-autoencoder/youtube-autoencoder.env
-chmod 600 ~/.config/youtube-autoencoder/youtube-autoencoder.env
+sudo useradd --create-home --user-group --shell /usr/sbin/nologin encoder
 ```
 
-Install the system service for a dedicated user named `encoder`:
+Create its private configuration and install the system units:
 
 ```bash
+sudo install -d -m 0700 -o encoder -g encoder /home/encoder/.config/youtube-autoencoder
+sudo install -m 0600 -o encoder -g encoder config/youtube-autoencoder.env.example /home/encoder/.config/youtube-autoencoder/youtube-autoencoder.env
 sudo install -m 0644 systemd/youtube-autoencoder@.service /etc/systemd/system/youtube-autoencoder@.service
 sudo install -m 0644 systemd/youtube-autoencoder-telemetry@.service /etc/systemd/system/youtube-autoencoder-telemetry@.service
 sudo install -m 0644 systemd/youtube-autoencoder-telemetry@.timer /etc/systemd/system/youtube-autoencoder-telemetry@.timer
@@ -191,6 +191,8 @@ sudo systemctl daemon-reload
 For a user service instead:
 
 ```bash
+mkdir -p ~/.config/youtube-autoencoder
+install -m 0600 config/youtube-autoencoder.env.example ~/.config/youtube-autoencoder/youtube-autoencoder.env
 mkdir -p ~/.config/systemd/user
 cp systemd/user/youtube-autoencoder.service ~/.config/systemd/user/
 cp systemd/user/youtube-autoencoder-telemetry.service ~/.config/systemd/user/
@@ -321,38 +323,37 @@ If the console only offers a generic installed-app flow in your environment, use
 
 ### 5. Install the OAuth Client JSON
 
-Copy the downloaded JSON to the service user's config directory:
-
-```text
-~/.config/youtube-autoencoder/google-oauth-client.json
-```
-
-Lock down the file:
+Install the downloaded JSON for the selected service mode. For system mode:
 
 ```bash
-chmod 600 ~/.config/youtube-autoencoder/google-oauth-client.json
+sudo install -m 0600 -o encoder -g encoder google-oauth-client.json /home/encoder/.config/youtube-autoencoder/google-oauth-client.json
+```
+
+For user mode:
+
+```bash
+install -m 0600 google-oauth-client.json ~/.config/youtube-autoencoder/google-oauth-client.json
 ```
 
 The file contains OAuth client credentials. Do not commit it, paste it into issue trackers, or store it in a world-readable location.
 
 ### 6. Authorize the Encoder
 
+For system mode, run the helper as the service account:
+
 ```bash
-youtube-autoencoder-api authorize
+sudo -u encoder -H youtube-autoencoder-api authorize
 ```
+
+For user mode, run `youtube-autoencoder-api authorize` directly.
 
 The command prints a verification URL and user code. Open the URL on any browser-capable device, enter the code, and approve access with the Google account that owns or manages the target YouTube channel.
 
-After approval, the helper stores the OAuth token cache at:
+After approval, the helper stores a mode-`0600` OAuth token cache under the selected service account:
 
 ```text
-~/.config/youtube-autoencoder/youtube-token.json
-```
-
-Lock down the token file:
-
-```bash
-chmod 600 ~/.config/youtube-autoencoder/youtube-token.json
+/home/encoder/.config/youtube-autoencoder/youtube-token.json  # system mode
+~/.config/youtube-autoencoder/youtube-token.json              # user mode
 ```
 
 Keep this file private. It contains the refresh token used for unattended operation.
@@ -361,16 +362,16 @@ Keep this file private. It contains the refresh token used for unattended operat
 
 If you already have an OBS-compatible `service.json` with a YouTube stream key:
 
-```bash
-youtube-autoencoder-api status
-```
+For system mode, run `sudo -u encoder -H youtube-autoencoder-api status`. For user mode, run `youtube-autoencoder-api status`.
 
 For a fresh setup, create the writable OBS service file with the placeholder `settings.key` shown in the Configuration Model. Then provision the reusable stream through an API-managed visible test after the rest of the encoder config is in place:
 
 ```bash
-YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
+sudo -u encoder -H env YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
   --duration 900 --privacy unlisted --create-stream --complete
 ```
+
+For user mode, omit `sudo -u encoder -H env` and place `YTA_INSTANCE_ID=encoder-hostname` before the helper command.
 
 This validates OAuth, reusable-stream provisioning, idempotent broadcast reconciliation, stream binding, ingest detection, transitions to `testing` and `live`, and explicit completion. The normal unattended service never completes on exit.
 
@@ -459,20 +460,22 @@ For a user service instead:
 systemctl --user enable --now youtube-autoencoder-telemetry.timer
 ```
 
-Do not enable both timers. Inspect timer execution and private samples with the commands for the selected mode:
+Do not enable both timers. For system mode, inspect timer execution and the service account's private samples with:
 
 ```bash
 sudo systemctl status youtube-autoencoder-telemetry@encoder.timer
 sudo journalctl -u youtube-autoencoder-telemetry@encoder.service
-python3 -m json.tool ~/.local/state/youtube-autoencoder/telemetry/latest.json
-tail ~/.local/state/youtube-autoencoder/telemetry/"$(date -u +%F)".jsonl
+sudo -u encoder python3 -m json.tool /home/encoder/.local/state/youtube-autoencoder/telemetry/latest.json
+sudo -u encoder tail /home/encoder/.local/state/youtube-autoencoder/telemetry/"$(date -u +%F)".jsonl
 ```
 
-For user mode, replace the first two commands with:
+For user mode:
 
 ```bash
 systemctl --user status youtube-autoencoder-telemetry.timer
 journalctl --user -u youtube-autoencoder-telemetry.service
+python3 -m json.tool ~/.local/state/youtube-autoencoder/telemetry/latest.json
+tail ~/.local/state/youtube-autoencoder/telemetry/"$(date -u +%F)".jsonl
 ```
 
 For system mode, disable the timer before setting `YTA_TELEMETRY_ENABLED=false`:

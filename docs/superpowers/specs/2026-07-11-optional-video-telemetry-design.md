@@ -87,7 +87,7 @@ The lifecycle-cache path continues to honor the existing `YTA_YOUTUBE_STATE_FILE
 }
 ```
 
-An empty `items` response is an explicit non-success result. The helper uses its existing structured error and redaction behavior. The command performs no write and does not acquire the lifecycle mutation lock.
+An empty `items` response is an explicit non-success result. The helper uses its existing structured error and redaction behavior. The command performs no lifecycle-state or YouTube-resource mutation and does not acquire the lifecycle mutation lock; normal OAuth access-token refresh may update the private token cache.
 
 ### Telemetry Collector
 

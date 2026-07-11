@@ -26,12 +26,12 @@ sudo systemctl daemon-reload
 
 These commands install but do not enable the system telemetry timer. The user timer also remains disabled unless it is separately installed and enabled.
 
-Create the service configuration:
+Create the dedicated account if it does not already exist, then install its private configuration:
 
 ```bash
-mkdir -p ~/.config/youtube-autoencoder
-cp config/youtube-autoencoder.env.example ~/.config/youtube-autoencoder/youtube-autoencoder.env
-chmod 600 ~/.config/youtube-autoencoder/youtube-autoencoder.env
+sudo useradd --create-home --user-group --shell /usr/sbin/nologin encoder
+sudo install -d -m 0700 -o encoder -g encoder /home/encoder/.config/youtube-autoencoder
+sudo install -m 0600 -o encoder -g encoder config/youtube-autoencoder.env.example /home/encoder/.config/youtube-autoencoder/youtube-autoencoder.env
 ```
 
 Edit the config file for your camera URL, OBS profile path, stable instance ID, staging/live privacy, and bitrate. For a public production stream, the lifecycle settings should include:
@@ -47,16 +47,16 @@ YTA_YOUTUBE_COMPLETE_ON_EXIT=false
 
 ## Authorize YouTube
 
-Copy your OAuth client JSON to:
+Install your OAuth client JSON for the system service account:
 
-```text
-~/.config/youtube-autoencoder/google-oauth-client.json
+```bash
+sudo install -m 0600 -o encoder -g encoder google-oauth-client.json /home/encoder/.config/youtube-autoencoder/google-oauth-client.json
 ```
 
 Then run:
 
 ```bash
-youtube-autoencoder-api authorize
+sudo -u encoder -H youtube-autoencoder-api authorize
 ```
 
 Approve the device code in a browser for the Google account that owns the YouTube channel.
@@ -64,7 +64,7 @@ Approve the device code in a browser for the Google account that owns the YouTub
 For a fresh deployment without an existing reusable stream, provision and validate it before enabling the production service:
 
 ```bash
-YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
+sudo -u encoder -H env YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
   --duration 900 --privacy unlisted --create-stream --complete
 ```
 
@@ -86,7 +86,7 @@ journalctl -u youtube-autoencoder@encoder.service -f
 
 ## Optional Video Telemetry
 
-Telemetry is disabled by default and never controls encoder recovery. To opt in, set this in the service user's private environment file:
+Telemetry is disabled by default and never controls encoder recovery. To opt in, set this in `/home/encoder/.config/youtube-autoencoder/youtube-autoencoder.env`:
 
 ```text
 YTA_TELEMETRY_ENABLED=true
@@ -108,15 +108,15 @@ systemctl --user daemon-reload
 systemctl --user enable --now youtube-autoencoder-telemetry.timer
 ```
 
-Inspect the selected timer and local samples:
+Inspect the system timer and the service account's local samples:
 
 ```bash
 sudo systemctl status youtube-autoencoder-telemetry@encoder.timer
-python3 -m json.tool ~/.local/state/youtube-autoencoder/telemetry/latest.json
-tail ~/.local/state/youtube-autoencoder/telemetry/"$(date -u +%F)".jsonl
+sudo -u encoder python3 -m json.tool /home/encoder/.local/state/youtube-autoencoder/telemetry/latest.json
+sudo -u encoder tail /home/encoder/.local/state/youtube-autoencoder/telemetry/"$(date -u +%F)".jsonl
 ```
 
-For user mode, inspect `systemctl --user status youtube-autoencoder-telemetry.timer`. For system mode, disable the timer before setting the flag back to `false`:
+For user mode, inspect `systemctl --user status youtube-autoencoder-telemetry.timer` and samples under `~/.local/state/youtube-autoencoder/telemetry/`. For system mode, disable the timer before setting the flag back to `false`:
 
 ```bash
 sudo systemctl disable --now youtube-autoencoder-telemetry@encoder.timer
