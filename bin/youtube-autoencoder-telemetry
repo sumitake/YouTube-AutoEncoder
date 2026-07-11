@@ -162,7 +162,7 @@ def telemetry_lock():
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except BlockingIOError:
-            pass
+            acquired = False
         yield acquired
     finally:
         if acquired:
