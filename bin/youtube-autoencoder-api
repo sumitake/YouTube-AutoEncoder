@@ -39,6 +39,10 @@ OBS_PROFILE_DIR = pathlib.Path(
 OBS_SERVICE_FILE = pathlib.Path(os.environ.get("YTA_OBS_SERVICE_FILE", OBS_PROFILE_DIR / "service.json")).expanduser()
 SCOPES = "https://www.googleapis.com/auth/youtube"
 API_BASE = "https://www.googleapis.com/youtube/v3"
+VIDEO_METRICS_FIELDS = (
+    "items(id,liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,"
+    "scheduledEndTime,concurrentViewers),statistics(viewCount,likeCount,commentCount))"
+)
 
 child: subprocess.Popen[Any] | None = None
 stopping = False
@@ -152,6 +156,12 @@ def read_state() -> dict[str, Any]:
         fsync_directory(STATE_FILE.parent)
         log(f"quarantined corrupt lifecycle state at {corrupt}")
         return {}
+
+
+def read_state_snapshot() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {}
+    return read_json(STATE_FILE)
 
 
 @contextlib.contextmanager
@@ -355,6 +365,53 @@ def token() -> str:
 def api(method: str, path: str, params: dict[str, str], body: dict[str, Any] | None = None) -> dict[str, Any]:
     query = urllib.parse.urlencode(params)
     return http_json(method, f"{API_BASE}{path}?{query}", token=token(), body=body)
+
+
+def metric_int(value: Any, field: str) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ReconciliationError(f"invalid {field} metric")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ReconciliationError(f"invalid {field} metric") from exc
+    if parsed < 0:
+        raise ReconciliationError(f"invalid {field} metric")
+    return parsed
+
+
+def video_metrics(video_id: str) -> dict[str, Any]:
+    data = api(
+        "GET",
+        "/videos",
+        {
+            "id": video_id,
+            "part": "liveStreamingDetails,statistics",
+            "fields": VIDEO_METRICS_FIELDS,
+        },
+    )
+    items = data.get("items") or []
+    if len(items) != 1 or not isinstance(items[0], dict):
+        raise ReconciliationError(f"video not found: {video_id}")
+    item = items[0]
+    if str(item.get("id") or "") != video_id:
+        raise ReconciliationError("videos.list returned an unexpected video id")
+    live = item.get("liveStreamingDetails") or {}
+    statistics = item.get("statistics") or {}
+    if not isinstance(live, dict) or not isinstance(statistics, dict):
+        raise ReconciliationError("videos.list returned malformed metrics")
+    return {
+        "video_id": video_id,
+        "actual_start_time": live.get("actualStartTime"),
+        "actual_end_time": live.get("actualEndTime"),
+        "scheduled_start_time": live.get("scheduledStartTime"),
+        "scheduled_end_time": live.get("scheduledEndTime"),
+        "concurrent_viewers": metric_int(live.get("concurrentViewers"), "concurrentViewers"),
+        "view_count": metric_int(statistics.get("viewCount"), "viewCount"),
+        "like_count": metric_int(statistics.get("likeCount"), "likeCount"),
+        "comment_count": metric_int(statistics.get("commentCount"), "commentCount"),
+    }
 
 
 def obs_stream_name() -> str:
@@ -968,6 +1025,17 @@ def state_command(_args: argparse.Namespace) -> int:
     return 0
 
 
+def video_metrics_command(args: argparse.Namespace) -> int:
+    video_id = args.video_id
+    if not video_id:
+        state = read_state_snapshot()
+        video_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
+    if not video_id:
+        raise ValueError("no broadcast id provided and no previous state file found")
+    print(json.dumps(video_metrics(video_id), indent=2, sort_keys=True))
+    return 0
+
+
 def reconcile_command(args: argparse.Namespace) -> int:
     stream = ensure_stream(create_if_missing=args.create_stream)
     stream_id = str(stream["id"])
@@ -1150,6 +1218,10 @@ def main() -> int:
 
     state_p = sub.add_parser("state", help="Show non-secret persisted lifecycle state")
     state_p.set_defaults(func=state_command)
+
+    video_metrics_p = sub.add_parser("video-metrics", help="Show read-only aggregate metrics for a live video")
+    video_metrics_p.add_argument("video_id", nargs="?")
+    video_metrics_p.set_defaults(func=video_metrics_command)
 
     stream_status_p = sub.add_parser("stream-status", help="Show reusable liveStream ingest status")
     stream_status_p.add_argument("stream_id", nargs="?")

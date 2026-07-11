@@ -1052,3 +1052,148 @@ def test_token_refresh_preserves_refresh_token(load_script, monkeypatch, tmp_pat
     assert stored["access_token"] == "new-access-token"
     assert stored["refresh_token"] == "refresh-token"
     assert token_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_video_metrics_uses_one_read_only_videos_list_call(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics")
+    calls = []
+
+    def request(method, path, params, body=None):
+        calls.append((method, path, params, body))
+        return {
+            "items": [{
+                "id": "video-1",
+                "liveStreamingDetails": {
+                    "actualStartTime": "2026-07-11T00:00:00Z",
+                    "concurrentViewers": "12",
+                },
+                "statistics": {"viewCount": "345", "likeCount": "6", "commentCount": "2"},
+            }]
+        }
+
+    monkeypatch.setattr(api, "api", request)
+    result = api.video_metrics("video-1")
+
+    assert calls == [(
+        "GET",
+        "/videos",
+        {
+            "id": "video-1",
+            "part": "liveStreamingDetails,statistics",
+            "fields": (
+                "items(id,liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,"
+                "scheduledEndTime,concurrentViewers),statistics(viewCount,likeCount,commentCount))"
+            ),
+        },
+        None,
+    )]
+    assert result["concurrent_viewers"] == 12
+    assert result["view_count"] == 345
+
+
+def test_video_metrics_leaves_absent_optional_values_as_none(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_missing")
+    monkeypatch.setattr(
+        api,
+        "api",
+        lambda *_args, **_kwargs: {"items": [{"id": "video-1", "statistics": {}}]},
+    )
+
+    result = api.video_metrics("video-1")
+
+    assert result["actual_start_time"] is None
+    assert result["actual_end_time"] is None
+    assert result["scheduled_start_time"] is None
+    assert result["scheduled_end_time"] is None
+    assert result["concurrent_viewers"] is None
+    assert result["view_count"] is None
+    assert result["like_count"] is None
+    assert result["comment_count"] is None
+
+
+@pytest.mark.parametrize("value", [True, False, -1, "-1", "not-a-number"])
+def test_metric_int_rejects_invalid_counts(load_script, value):
+    api = load_script("youtube-autoencoder-api", f"yta_api_metric_int_{str(value).replace('-', 'n')}")
+
+    with pytest.raises(api.ReconciliationError, match="invalid viewCount metric"):
+        api.metric_int(value, "viewCount")
+
+
+def test_video_metrics_rejects_empty_items(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_empty")
+    monkeypatch.setattr(api, "api", lambda *_args, **_kwargs: {"items": []})
+
+    with pytest.raises(api.ReconciliationError, match="video not found: video-1"):
+        api.video_metrics("video-1")
+
+
+def test_video_metrics_rejects_mismatched_response_video_id(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_mismatch")
+    monkeypatch.setattr(api, "api", lambda *_args, **_kwargs: {"items": [{"id": "video-2"}]})
+
+    with pytest.raises(api.ReconciliationError, match="unexpected video id"):
+        api.video_metrics("video-1")
+
+
+def test_video_metrics_command_explicit_id_does_not_read_lifecycle_state(load_script, monkeypatch, capsys):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_explicit_command")
+    result = {"video_id": "video-1", "view_count": 345}
+
+    def fail_read():
+        raise AssertionError("explicit video metrics must not read lifecycle state")
+
+    monkeypatch.setattr(api, "read_state", fail_read)
+    monkeypatch.setattr(api, "read_state_snapshot", fail_read)
+    monkeypatch.setattr(api, "video_metrics", lambda video_id: result if video_id == "video-1" else None)
+
+    assert api.video_metrics_command(argparse.Namespace(video_id="video-1")) == 0
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_video_metrics_command_reads_broadcast_id_from_snapshot(load_script, monkeypatch, capsys):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_snapshot_command")
+    monkeypatch.setattr(api, "read_state_snapshot", lambda: {"broadcast_id": "video-1"})
+    monkeypatch.setattr(api, "video_metrics", lambda video_id: {"video_id": video_id, "view_count": 345})
+
+    assert api.video_metrics_command(argparse.Namespace(video_id=None)) == 0
+    assert json.loads(capsys.readouterr().out) == {"video_id": "video-1", "view_count": 345}
+
+
+def test_video_metrics_command_rejects_missing_cached_broadcast_id(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_missing_snapshot")
+    state = tmp_path / "youtube-live-state.json"
+    state.write_text(json.dumps({"lifecycle": "live"}), encoding="utf-8")
+    monkeypatch.setattr(api, "STATE_FILE", state)
+
+    with pytest.raises(ValueError, match="no broadcast id provided"):
+        api.video_metrics_command(argparse.Namespace(video_id=None))
+
+
+def test_video_metrics_command_does_not_mutate_malformed_state(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_malformed_snapshot")
+    state = tmp_path / "youtube-live-state.json"
+    state.write_text("{broken", encoding="utf-8")
+    before = state.read_bytes()
+    monkeypatch.setattr(api, "STATE_FILE", state)
+
+    with pytest.raises(json.JSONDecodeError):
+        api.video_metrics_command(argparse.Namespace(video_id=None))
+
+    assert state.exists()
+    assert state.read_bytes() == before
+    assert list(tmp_path.glob("youtube-live-state.json.corrupt.*")) == []
+
+
+def test_video_metrics_parser_accepts_optional_video_id(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_parser")
+    observed = []
+
+    def command(args):
+        observed.append(args.video_id)
+        return 0
+
+    monkeypatch.setattr(api, "video_metrics_command", command)
+    monkeypatch.setattr(api.sys, "argv", ["youtube-autoencoder-api", "video-metrics"])
+
+    assert api.main() == 0
+    assert observed == [None]
