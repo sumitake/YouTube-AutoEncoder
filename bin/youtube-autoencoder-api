@@ -921,22 +921,9 @@ def set_broadcast_privacy(broadcast_id: str, privacy: str) -> dict[str, Any]:
     current = broadcast_by_id(broadcast_id)
     if current is None:
         raise ReconciliationError(f"liveBroadcast not found: {broadcast_id}")
-    snippet = current.get("snippet") or {}
-    content_details = current.get("contentDetails") or {}
-    monitor = content_details.get("monitorStream") or {}
     status = current.get("status") or {}
-    scheduled_start = snippet.get("scheduledStartTime")
-    if not scheduled_start:
-        raise ReconciliationError("broadcast has no scheduledStartTime required for privacy update")
     body = {
         "id": broadcast_id,
-        "snippet": {"scheduledStartTime": scheduled_start},
-        "contentDetails": {
-            "monitorStream": {
-                "enableMonitorStream": bool(monitor.get("enableMonitorStream", True)),
-                "broadcastStreamDelayMs": int(monitor.get("broadcastStreamDelayMs") or 0),
-            }
-        },
         "status": {
             "privacyStatus": privacy,
             "selfDeclaredMadeForKids": bool(status.get("selfDeclaredMadeForKids", False)),

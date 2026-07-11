@@ -2,6 +2,12 @@
 
 All notable project changes are recorded here. The README shows only the most recent entry.
 
+## 2026-07-11 - Live Visibility Publication Fix
+
+- Corrected privacy-only `liveBroadcasts.update` requests so `part=status` sends only the matching `id` and `status` resource fields, eliminating HTTP 400 `unexpectedPart` failures after the healthy-live gate.
+- Preserved made-for-kids status and post-update privacy verification while removing unrelated scheduled-start and monitor-stream fields from publication requests.
+- Added regression coverage for the exact part/body contract used to promote an existing live broadcast without creating or replacing it.
+
 ## 2026-07-11 - Optional Video Telemetry
 
 - Added an opt-in `videos.list` command and one-shot collector for aggregate live-stream timing, viewer, view, like, and comment metrics.

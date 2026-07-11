@@ -517,10 +517,10 @@ Each eligible collection performs one [`videos.list`](https://developers.google.
 
 Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full history.
 
-### 2026-07-11 - Optional Video Telemetry
+### 2026-07-11 - Live Visibility Publication Fix
 
-- Added disabled-by-default, quota-bounded aggregate video telemetry through one read-only `videos.list` call per eligible collection, with private local snapshots, write-ahead throttling, retention, and independent system or user timers.
-- Telemetry remains isolated from FFmpeg supervision, broadcast recovery, lifecycle transitions, privacy changes, and retry state.
+- Corrected the privacy-only YouTube update payload so a healthy live broadcast can be promoted from unlisted to the configured final visibility without an HTTP 400 `unexpectedPart` failure.
+- Publication still preserves the existing broadcast and verifies the remote privacy readback before declaring the stream stable.
 
 ## Repository Layout
 
