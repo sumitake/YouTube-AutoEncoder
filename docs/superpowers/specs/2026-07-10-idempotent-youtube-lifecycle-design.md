@@ -1,6 +1,7 @@
 # Idempotent YouTube Lifecycle Recovery Design
 
 Date: 2026-07-10
+Updated: 2026-07-11
 
 ## Summary
 
@@ -14,6 +15,8 @@ The design is based on direct observation of the current Raspberry Pi deployment
 
 - The configured camera is reachable. FFprobe reports H.264 Main video at 2688x1520 and approximately 20 fps.
 - Raspberry Pi FFmpeg 5.1.9 rejects the deployed input option with `Option rw_timeout not found` and exits immediately.
+- A later unmarked legacy event auto-started on ingest and auto-stopped seven seconds later when an insert throttle caused the supervisor to terminate FFmpeg.
+- Repeated `liveBroadcasts.insert` attempts returned `User requests exceed the rate limit.`; read-only stream and broadcast inventory calls continued to succeed.
 - The same camera-to-local-FLV command succeeds when `-rw_timeout` is removed.
 - The supervisor waits up to 180 seconds in a synchronous YouTube helper while the FFmpeg child has already exited. It does not drain or inspect the child during this wait.
 - Every retry creates and binds another event before FFmpeg is proven viable.
@@ -115,14 +118,14 @@ Title-prefix matching alone is never sufficient.
 ```mermaid
 stateDiagram-v2
     [*] --> WaitForSource
-    WaitForSource --> StartEncoder: source probe passes
+    WaitForSource --> ReconcileBroadcast: source probe passes
+    ReconcileBroadcast --> Blocked: ambiguous, unknown, or unmarked bound event
+    ReconcileBroadcast --> StartEncoder: marked unlisted broadcast is bound
     StartEncoder --> WaitForSource: FFmpeg exits or stalls
     StartEncoder --> WaitForIngest: media progress observed
     WaitForIngest --> WaitForSource: FFmpeg exits or stalls
-    WaitForIngest --> ReconcileBroadcast: YouTube stream active
-    ReconcileBroadcast --> Blocked: ambiguous or unknown remote state
-    ReconcileBroadcast --> Testing: created or ready broadcast
-    ReconcileBroadcast --> ConfirmLive: testing or live broadcast
+    WaitForIngest --> Testing: created or ready broadcast and stream active
+    WaitForIngest --> ConfirmLive: testing or live broadcast and stream active
     Testing --> WaitForSource: encoder or ingest becomes unhealthy
     Testing --> ConfirmLive: live transition accepted
     ConfirmLive --> WaitForSource: encoder or ingest becomes unhealthy
@@ -157,15 +160,15 @@ Only a terminal state permits a new broadcast generation. Unknown lifecycle valu
 2. Read the local cache. If it is malformed, rename it to a timestamped `.corrupt` file and continue without trusting it.
 3. If the cache contains a broadcast ID, fetch that broadcast by ID.
 4. Verify the instance marker, stream relationship, and lifecycle.
-5. If the cached broadcast is invalid or missing, list owned active and upcoming event broadcasts and filter by exact instance marker and stream ID.
-6. Adopt exactly one match.
-7. If multiple matches exist, enter a blocked state and create nothing.
-8. If no match exists and ingest is not active, create nothing.
-9. If no match exists and ingest is active, generate a new generation ID and durably persist a `create` intent before the API call.
+5. List owned active and upcoming event broadcasts before starting FFmpeg.
+6. Block if any unmarked recoverable broadcast is bound to the reusable stream; automatic legacy adoption is prohibited.
+7. Filter remaining candidates by exact instance and generation markers and adopt exactly one match.
+8. If multiple marked matches exist, enter a blocked state and create nothing.
+9. If no match exists, generate or retain one generation ID and durably persist a `create` intent before the API call.
 10. Reconcile once more for that exact generation marker, then create one unlisted broadcast only if it still does not exist.
 11. Persist the returned broadcast ID immediately, marking binding as pending.
-12. Bind it to the reusable stream, then persist the updated state.
-13. Before every subsequent mutation, repeat remote validation.
+12. Bind it to the reusable stream, persist the updated state, and only then permit FFmpeg ingest to start.
+13. Require fresh active ingest before `testing` or `live`, and repeat remote validation before every subsequent mutation.
 
 If an insert request times out after YouTube may have accepted it, the next attempt searches for the exact persisted generation marker before another insert. This closes the lost-response orphan window without relying on title or creation-time heuristics.
 
@@ -206,7 +209,7 @@ An already-public live broadcast is never demoted during recovery. A later camer
 
 FFmpeg will emit machine-readable progress at a bounded interval. The supervisor updates a monotonic last-progress timestamp from output-time or frame progress and continues to drain normal redacted logs.
 
-If FFmpeg is alive but does not report media progress within `YTA_FFMPEG_PROGRESS_TIMEOUT_SEC`, the supervisor sends SIGINT, waits for graceful exit, then kills the process if required. No YouTube creation or transition occurs while progress is stale.
+If FFmpeg is alive but does not report media progress within `YTA_FFMPEG_PROGRESS_TIMEOUT_SEC`, the supervisor sends SIGINT, waits for graceful exit, then kills the process if required. No YouTube transition or public promotion occurs while progress is stale; the single staged unlisted event remains available for recovery.
 
 ### Copy Mode
 
@@ -309,7 +312,7 @@ The API helper returns structured failure details containing:
 - `Retry-After` when present.
 - A redacted human-readable message.
 
-The supervisor must not classify behavior from a Python traceback. Logs include lifecycle transitions, retry class, cooldown time, stream health, broadcast ID, and watch URL. Camera credentials, OAuth material, and stream keys remain redacted.
+The supervisor must not classify behavior from a Python traceback. Logs include API operation, HTTP status, structured reason, lifecycle transitions, retry class, cooldown time, stream health, broadcast ID, and watch URL. Camera credentials, OAuth material, and stream keys remain redacted.
 
 The systemd service continues to run as the dedicated unprivileged user. Root is needed only to install files and manage the system unit.
 
@@ -334,12 +337,15 @@ The implementation adds or formalizes:
 - FFmpeg arguments omit unsupported `-rw_timeout`.
 - Capability checks include or omit `-timeout` correctly and time out safely.
 - Source failure performs no YouTube broadcast operation.
-- FFmpeg exit before active ingest performs no insert or transition.
+- One marked unlisted broadcast is staged and bound before FFmpeg starts.
+- An unmarked recoverable event bound to the reusable stream blocks before ingest.
+- FFmpeg exit before active ingest retains the staged event and performs no transition.
 - Stale media progress terminates FFmpeg and blocks lifecycle mutation.
 - Cached `created`, `ready`, `testStarting`, `testing`, `liveStarting`, and `live` broadcasts are reused.
 - `complete`, `revoked`, or confirmed missing broadcasts permit one replacement.
 - Unknown lifecycle values block creation.
 - A write-ahead generation is durable before insert, and a lost insert response is reconciled by exact generation marker before retry.
+- Insert throttling retains the same pending generation, and bind failure retries the same broadcast ID without reinserting.
 - A crash after insert and before bind resumes binding the same ID.
 - Multiple exact marker matches block automatic adoption and insertion.
 - Unrelated title-prefix matches are ignored.

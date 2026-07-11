@@ -296,6 +296,27 @@ def test_api_wait_parses_structured_error(load_script, monkeypatch):
     assert raised.value.retry_after == 120
 
 
+def test_api_error_reports_operation_status_and_reasons_without_secrets(load_script):
+    supervisor = load_script("youtube-autoencoder", "yta_supervisor_api_diagnostic")
+
+    error = supervisor.ApiCommandError(
+        returncode=75,
+        operation="reconcile-broadcast",
+        payload={
+            "http_status": 403,
+            "message": "request failed for rtmps://youtube.example/live/secret-key",
+            "reasons": ["userRequestsExceedRateLimit"],
+            "retry_class": "quota",
+        },
+    )
+
+    message = str(error)
+    assert "operation=reconcile-broadcast" in message
+    assert "http_status=403" in message
+    assert "reasons=userRequestsExceedRateLimit" in message
+    assert "secret-key" not in message
+
+
 def test_api_wait_spools_large_helper_output_without_pipe_backpressure(load_script, monkeypatch):
     supervisor = load_script("youtube-autoencoder", "yta_supervisor_api_spool")
     payload = {"stream_id": "stream-1", "padding": "x" * 100_000}
@@ -404,6 +425,48 @@ def test_created_lifecycle_waits_for_ready_before_transition(load_script, monkey
 
     assert state["lifecycle"] == "live"
     assert events == ["wait", "observe"]
+
+
+def test_current_observation_rejects_broadcast_rebound_to_different_stream(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_observation_wrong_stream")
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+    responses = iter(
+        [
+            {"stream_id": "stream-1", "stream_status": "active", "health": "good"},
+            {
+                "broadcast_id": "broadcast-1",
+                "lifecycle": "ready",
+                "privacy": "unlisted",
+                "bound_stream_id": "stream-2",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "api_command_while_streaming",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    with pytest.raises(supervisor.ApiCommandError, match="bound to a different stream") as raised:
+        supervisor.current_observation(
+            runtime,
+            {
+                "stream_id": "stream-1",
+                "broadcast_id": "broadcast-1",
+                "lifecycle": "ready",
+                "privacy": "unlisted",
+            },
+        )
+
+    assert raised.value.retry_class == "ambiguous"
 
 
 @pytest.mark.parametrize(
@@ -616,6 +679,121 @@ def test_managed_lifecycle_waits_for_ingest_before_reconcile(load_script, monkey
     assert state["privacy"] == "public"
 
 
+def test_prepared_lifecycle_reuses_staged_state_after_ingest(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_prepared_lifecycle")
+    events = []
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+    prepared = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "ready",
+        "privacy": "unlisted",
+    }
+
+    monkeypatch.setattr(
+        supervisor,
+        "wait_for_active_stream",
+        lambda _runtime: events.append("active") or {"stream_id": "stream-1"},
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "api_command_while_streaming",
+        lambda *_args, **_kwargs: pytest.fail("prepared state was reconciled again"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "reconcile_lifecycle",
+        lambda _runtime, state: events.append("lifecycle") or {**state, "lifecycle": "live"},
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "publish_when_healthy",
+        lambda _runtime, state: events.append("publish") or {**state, "privacy": "public"},
+    )
+
+    state = supervisor.manage_youtube_lifecycle(runtime, prepared_state=prepared)
+
+    assert events == ["active", "lifecycle", "publish"]
+    assert state["privacy"] == "public"
+
+
+def test_nonpublic_state_is_staged_before_ffmpeg_starts(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_preingest_stage_order")
+    events = []
+    cached = {
+        "stream_id": "stream-1",
+        "generation_id": "generation-1",
+        "pending_action": "create",
+        "privacy": "unlisted",
+    }
+    prepared = {
+        **cached,
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "ready",
+    }
+
+    class Process:
+        stdout = None
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(supervisor, "stream_config", lambda: ("rtsp://camera/stream", "rtmps://youtube/live/key"))
+    monkeypatch.setattr(supervisor, "source_available", lambda _url: True)
+    monkeypatch.setattr(supervisor, "ffmpeg_args", lambda *_args, **_kwargs: ["ffmpeg"])
+    monkeypatch.setattr(
+        supervisor,
+        "prepare_youtube_lifecycle",
+        lambda state: events.append("stage") or prepared,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: events.append("ffmpeg") or Process(),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "manage_with_public_fallback",
+        lambda _runtime, state: events.append(("manage", state)) or state,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "supervise_stream",
+        lambda *_args, **_kwargs: events.append("supervise") or 0,
+    )
+
+    assert supervisor.run_once(cached_state=cached) == 0
+    assert events[0:2] == ["stage", "ffmpeg"]
+    assert events[2] == ("manage", prepared)
+
+
+def test_verified_public_state_skips_preingest_api_staging(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_public_preingest_skip")
+    cached = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "live",
+        "privacy": "public",
+    }
+    monkeypatch.setattr(
+        supervisor,
+        "api_command",
+        lambda *_args, **_kwargs: pytest.fail("public recovery was blocked on the API"),
+    )
+
+    assert supervisor.prepare_youtube_lifecycle(cached) == cached
+
+
 def test_legacy_public_privacy_never_changes_staging_default(load_script, monkeypatch):
     supervisor = load_script("youtube-autoencoder", "yta_staging_legacy_privacy")
     monkeypatch.delenv("YTA_YOUTUBE_STAGING_PRIVACY", raising=False)
@@ -654,7 +832,11 @@ def test_cached_public_stream_continues_during_api_quota_failure(load_script, mo
         returncode=75,
         payload={"message": "rate limited", "retry_class": "quota"},
     )
-    monkeypatch.setattr(supervisor, "manage_youtube_lifecycle", lambda _runtime: (_ for _ in ()).throw(failure))
+    monkeypatch.setattr(
+        supervisor,
+        "manage_youtube_lifecycle",
+        lambda _runtime, prepared_state=None: (_ for _ in ()).throw(failure),
+    )
     monkeypatch.setattr(supervisor, "retry_delay", lambda *_args, **_kwargs: 900)
 
     def capture(args, _runtime, timeout):
@@ -691,7 +873,11 @@ def test_prepublic_api_failure_does_not_enter_public_fallback(load_script, monke
         returncode=75,
         payload={"message": "rate limited", "retry_class": "quota"},
     )
-    monkeypatch.setattr(supervisor, "manage_youtube_lifecycle", lambda _runtime: (_ for _ in ()).throw(failure))
+    monkeypatch.setattr(
+        supervisor,
+        "manage_youtube_lifecycle",
+        lambda _runtime, prepared_state=None: (_ for _ in ()).throw(failure),
+    )
 
     with pytest.raises(supervisor.ApiCommandError):
         supervisor.manage_with_public_fallback(runtime, cached)
