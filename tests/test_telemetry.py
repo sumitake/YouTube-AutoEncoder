@@ -372,6 +372,19 @@ def test_successful_collection_persists_one_private_sample(load_script, monkeypa
     assert collector_state == {"last_attempt_at": "2026-07-10T12:00:00Z", "last_success_at": "2026-07-10T12:00:00Z"}
 
 
+def test_append_jsonl_preserves_existing_records(load_script, tmp_path):
+    telemetry = load_script("youtube-autoencoder-telemetry", "yta_telemetry_append")
+    daily = tmp_path / "2026-07-10.jsonl"
+
+    telemetry.append_jsonl(daily, {"sequence": 1})
+    telemetry.append_jsonl(daily, {"sequence": 2})
+
+    assert [json.loads(line) for line in daily.read_text(encoding="utf-8").splitlines()] == [
+        {"sequence": 1},
+        {"sequence": 2},
+    ]
+
+
 @pytest.mark.parametrize(
     ("result", "expected_status", "expected_log"),
     [

@@ -102,7 +102,7 @@ def durable_json(path: pathlib.Path, data: dict[str, Any]) -> None:
     temporary = pathlib.Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             descriptor = -1
             json.dump(data, handle, sort_keys=True)
             handle.write("\n")
