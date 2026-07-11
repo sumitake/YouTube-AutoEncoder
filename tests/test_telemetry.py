@@ -3,10 +3,17 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import pathlib
 import subprocess
 import types
 
 import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def repo_text(relative_path: str) -> str:
+    return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
 def configure_collector(telemetry, monkeypatch, tmp_path, state):
@@ -515,3 +522,86 @@ def test_retention_days_numeric_values_below_one_clamp_to_one(load_script, monke
     monkeypatch.setenv("YTA_TELEMETRY_RETENTION_DAYS", value)
 
     assert telemetry.telemetry_retention_days() == 1
+
+
+def test_telemetry_units_example_config_is_disabled_and_quota_bounded():
+    config = repo_text("config/youtube-autoencoder.env.example")
+
+    assert "YTA_TELEMETRY_ENABLED=false" in config
+    assert "YTA_TELEMETRY_MIN_INTERVAL_SEC=300" in config
+    assert "YTA_TELEMETRY_RETENTION_DAYS=30" in config
+    assert "YTA_TELEMETRY_API=/usr/local/bin/youtube-autoencoder-api" in config
+    assert "Enable exactly one telemetry timer mode" in config
+
+
+@pytest.mark.parametrize(
+    ("path", "environment_file", "working_directory", "user_line"),
+    [
+        (
+            "systemd/youtube-autoencoder-telemetry@.service",
+            "/home/%i/.config/youtube-autoencoder/youtube-autoencoder.env",
+            "/home/%i",
+            "User=%i",
+        ),
+        (
+            "systemd/user/youtube-autoencoder-telemetry.service",
+            "%h/.config/youtube-autoencoder/youtube-autoencoder.env",
+            "%h",
+            None,
+        ),
+    ],
+)
+def test_telemetry_units_services_are_isolated_oneshots(path, environment_file, working_directory, user_line):
+    service = repo_text(path)
+
+    assert "Type=oneshot" in service
+    assert f"EnvironmentFile={environment_file}" in service
+    assert "ExecStart=/usr/local/bin/youtube-autoencoder-telemetry" in service
+    assert f"WorkingDirectory={working_directory}" in service
+    assert "Nice=10" in service
+    assert "IOSchedulingClass=idle" in service
+    if user_line is not None:
+        assert user_line in service
+    assert "youtube-autoencoder@" not in service
+    assert "youtube-autoencoder.service" not in service
+    assert "Restart=" not in service
+
+
+@pytest.mark.parametrize(
+    ("path", "service_unit"),
+    [
+        ("systemd/youtube-autoencoder-telemetry@.timer", "youtube-autoencoder-telemetry@%i.service"),
+        ("systemd/user/youtube-autoencoder-telemetry.timer", "youtube-autoencoder-telemetry.service"),
+    ],
+)
+def test_telemetry_units_timers_have_exact_nonpersistent_cadence(path, service_unit):
+    timer = repo_text(path)
+
+    assert "OnBootSec=5min" in timer
+    assert "OnUnitActiveSec=5min" in timer
+    assert "AccuracySec=30s" in timer
+    assert "RandomizedDelaySec=30s" in timer
+    assert "Persistent=false" in timer
+    assert f"Unit={service_unit}" in timer
+    assert "WantedBy=timers.target" in timer
+
+
+def test_telemetry_units_do_not_couple_existing_encoder_services():
+    assert "telemetry" not in repo_text("systemd/youtube-autoencoder@.service").casefold()
+    assert "telemetry" not in repo_text("systemd/user/youtube-autoencoder.service").casefold()
+
+
+def test_telemetry_units_ci_validates_collector_and_all_units():
+    workflow = repo_text(".github/workflows/ci.yml")
+
+    assert "bin/youtube-autoencoder-telemetry" in workflow
+    assert "sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-autoencoder-telemetry" in workflow
+    for unit in (
+        "systemd/youtube-autoencoder@.service",
+        "systemd/youtube-autoencoder-telemetry@.service",
+        "systemd/youtube-autoencoder-telemetry@.timer",
+        "systemd/user/youtube-autoencoder.service",
+        "systemd/user/youtube-autoencoder-telemetry.service",
+        "systemd/user/youtube-autoencoder-telemetry.timer",
+    ):
+        assert unit in workflow

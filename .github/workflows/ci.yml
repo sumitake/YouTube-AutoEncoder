@@ -41,7 +41,7 @@ jobs:
         run: ruff check .
 
       - name: Compile scripts
-        run: python -m py_compile bin/youtube-autoencoder bin/youtube-autoencoder-api bin/youtube-autoencoder-test-pattern
+        run: python -m py_compile bin/youtube-autoencoder bin/youtube-autoencoder-api bin/youtube-autoencoder-test-pattern bin/youtube-autoencoder-telemetry
 
       - name: Run tests
         run: pytest -q
@@ -51,11 +51,19 @@ jobs:
           test -x bin/youtube-autoencoder
           test -x bin/youtube-autoencoder-api
           test -x bin/youtube-autoencoder-test-pattern
+          test -x bin/youtube-autoencoder-telemetry
 
       - name: Verify systemd units
         run: |
           sudo install -m 0755 bin/youtube-autoencoder /usr/local/bin/youtube-autoencoder
-          systemd-analyze verify systemd/youtube-autoencoder@.service systemd/user/youtube-autoencoder.service
+          sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-autoencoder-telemetry
+          systemd-analyze verify \
+            systemd/youtube-autoencoder@.service \
+            systemd/youtube-autoencoder-telemetry@.service \
+            systemd/youtube-autoencoder-telemetry@.timer \
+            systemd/user/youtube-autoencoder.service \
+            systemd/user/youtube-autoencoder-telemetry.service \
+            systemd/user/youtube-autoencoder-telemetry.timer
 
   repository-metadata:
     name: Repository Metadata
