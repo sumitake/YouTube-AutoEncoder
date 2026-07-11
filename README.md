@@ -28,50 +28,7 @@ The intended outcome is an appliance-like encoder that can be deployed on a Rasp
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    subgraph ArchitectureInputs["Source and compatibility inputs"]
-        direction LR
-        Camera["RTSP camera"]
-        ObsScene["Optional OBS scene"]
-        ObsService["Optional OBS service profile"]
-    end
-
-    subgraph ArchitectureHost["Encoder host"]
-        direction TB
-        Systemd["systemd service"]
-        Supervisor["youtube-autoencoder supervisor"]
-        Probe["FFprobe source validation"]
-        Encoder["FFmpeg media pipeline"]
-        Helper["youtube-autoencoder-api"]
-        State["Durable state and locks"]
-        OAuth["OAuth client and token"]
-    end
-
-    subgraph ArchitectureYouTube["YouTube"]
-        direction LR
-        Ingest["Reusable liveStream ingest"]
-        Api["YouTube Data API v3"]
-        Broadcast["One marked liveBroadcast and watch page"]
-    end
-
-    Systemd -->|"start and restart"| Supervisor
-    ObsScene -->|"source discovery"| Supervisor
-    ObsService -->|"ingest compatibility"| Supervisor
-    Supervisor -->|"probe"| Probe
-    Camera -->|"RTSP media"| Probe
-    Probe -->|"source health"| Supervisor
-    Supervisor -->|"spawn and supervise"| Encoder
-    Camera -->|"video"| Encoder
-    Encoder -->|"progress"| Supervisor
-    Encoder -->|"RTMPS media"| Ingest
-    Supervisor -->|"bounded JSON commands"| Helper
-    Helper <-->|"read and write"| State
-    OAuth -->|"authorization"| Helper
-    Helper <-->|"lifecycle and health"| Api
-    Ingest -->|"stream health"| Api
-    Api <-->|"create, bind, transition, verify"| Broadcast
-```
+See the [system architecture diagram](docs/architecture-and-flows.md#system-architecture) for component boundaries and media/control data flows.
 
 The supervisor owns local process health, polling, backoff, and publication timing. The API helper owns OAuth, remote resource reconciliation, durable lifecycle state, and serialized mutations. YouTube remains authoritative; the local state file is a recovery cache and is revalidated before mutations.
 
@@ -134,38 +91,7 @@ OBS compatibility mode can also read and update:
 
 Every recovery path first preserves ownership and retry state. Media must be fresh and YouTube ingest active before reconciliation can create or transition anything.
 
-```mermaid
-stateDiagram-v2
-    state "Startup or restart" as RecoveryStartup
-    state "Managed stream generation" as RecoveryGeneration {
-        state "Probe source and start FFmpeg" as RecoveryMedia
-        state "Require fresh active ingest" as RecoveryIngest
-        state "Reconcile exact ownership markers" as RecoveryReconcile
-        state "Create and bind unlisted generation" as RecoveryCreate
-        state "Resume one nonterminal event" as RecoveryManaged
-        state "Testing, live, and publication gates" as RecoveryGates
-        state "Verified public stream" as RecoveryStable
-        state "Public stream with API cooldown" as RecoveryPublicFallback
-
-        [*] --> RecoveryMedia
-        RecoveryMedia --> RecoveryIngest : media progress fresh
-        RecoveryIngest --> RecoveryReconcile : YouTube ingest active
-        RecoveryReconcile --> RecoveryManaged : one marked nonterminal event
-        RecoveryReconcile --> RecoveryCreate : none, terminal, or missing
-        RecoveryCreate --> RecoveryManaged : insert and bind verified
-        RecoveryManaged --> RecoveryGates
-        RecoveryGates --> RecoveryStable : two healthy live observations and privacy readback
-        RecoveryStable --> RecoveryPublicFallback : API unavailable, media healthy
-        RecoveryPublicFallback --> RecoveryStable : API recovers
-    }
-    state "Persist classified cooldown" as RecoveryBackoff
-
-    [*] --> RecoveryStartup
-    RecoveryStartup --> RecoveryBackoff : retry deadline active
-    RecoveryBackoff --> RecoveryStartup : deadline expires or host restarts
-    RecoveryStartup --> RecoveryGeneration : no active deadline
-    RecoveryGeneration --> RecoveryBackoff : recoverable failure, preserve ownership
-```
+See the [recovery state machine](docs/architecture-and-flows.md#recovery-state-machine) for startup, managed-generation, and durable-cooldown transitions.
 
 | Failure | Expected behavior |
 | --- | --- |
@@ -200,45 +126,7 @@ This verifies the YouTube account, OAuth token, reusable stream, ingest URL, bro
 
 Provision the YouTube control plane and the encoder host in this order. The detailed console steps and commands remain in the sections that follow.
 
-```mermaid
-flowchart TD
-    DeploymentChannel["Enable YouTube Live on the target channel"]
-    DeploymentProject["Enable YouTube Data API v3"]
-    DeploymentAudience["Configure a compatible OAuth audience"]
-    DeploymentClient["Create a TV or Limited Input OAuth client"]
-    DeploymentRuntime["Install FFmpeg, Python, and project scripts"]
-    DeploymentConfig["Create private encoder, OAuth, and writable service files"]
-    DeploymentAuthorize["Authorize the channel account"]
-    DeploymentCamera["Configure camera source and ingest profile"]
-    DeploymentStreamDecision{"Reusable stream already configured?"}
-    DeploymentProvision["Run visible test with --create-stream"]
-    DeploymentValidate["Run unlisted visible validation"]
-    DeploymentValidationDecision{"Validation succeeds?"}
-    DeploymentDiagnose["Fix OAuth, source, ingest, or quota issue"]
-    DeploymentEnable["Enable the systemd service"]
-    DeploymentReboot["Reboot the encoder host"]
-    DeploymentVerify["Verify encoder and remote-management recovery"]
-    DeploymentOperate["Unattended operation"]
-
-    DeploymentChannel --> DeploymentProject
-    DeploymentProject --> DeploymentAudience
-    DeploymentAudience --> DeploymentClient
-    DeploymentClient --> DeploymentRuntime
-    DeploymentRuntime --> DeploymentConfig
-    DeploymentConfig --> DeploymentAuthorize
-    DeploymentAuthorize --> DeploymentCamera
-    DeploymentCamera --> DeploymentStreamDecision
-    DeploymentStreamDecision -->|"No"| DeploymentProvision
-    DeploymentProvision --> DeploymentValidate
-    DeploymentStreamDecision -->|"Yes"| DeploymentValidate
-    DeploymentValidate --> DeploymentValidationDecision
-    DeploymentValidationDecision -->|"No"| DeploymentDiagnose
-    DeploymentDiagnose --> DeploymentStreamDecision
-    DeploymentValidationDecision -->|"Yes"| DeploymentEnable
-    DeploymentEnable --> DeploymentReboot
-    DeploymentReboot --> DeploymentVerify
-    DeploymentVerify --> DeploymentOperate
-```
+See the [provisioning and deployment flow](docs/architecture-and-flows.md#provisioning-and-deployment) for the end-to-end setup sequence.
 
 Install runtime packages:
 
@@ -550,6 +438,7 @@ bin/youtube-autoencoder-test-pattern Temporary moving test-pattern stream
 config/youtube-autoencoder.env.example
 systemd/youtube-autoencoder@.service System service template
 systemd/user/youtube-autoencoder.service User service template
+docs/architecture-and-flows.md       Architecture and operational flow diagrams
 docs/raspberry-pi.md                 Raspberry Pi deployment notes
 CHANGELOG.md                         Full project changelog
 ```
