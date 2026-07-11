@@ -741,9 +741,11 @@ def test_list_managed_broadcasts_requires_exact_marker(load_script, monkeypatch)
     assert [item["id"] for item in api.list_managed_broadcasts("encoder-1")] == ["broadcast-1"]
 
 
-def test_set_broadcast_privacy_preserves_required_fields_and_verifies_readback(load_script, monkeypatch):
+def test_set_broadcast_privacy_sends_only_status_part_and_verifies_readback(load_script, monkeypatch):
     api = load_script("youtube-autoencoder-api", "yta_api_privacy")
     current = managed_broadcast(api, "broadcast-1", "live")
+    current["snippet"].pop("scheduledStartTime")
+    current["contentDetails"].pop("monitorStream")
     public = {
         **current,
         "status": {**current["status"], "privacyStatus": "public"},
@@ -768,8 +770,6 @@ def test_set_broadcast_privacy_preserves_required_fields_and_verifies_readback(l
             "params": {"part": "status"},
             "body": {
                 "id": "broadcast-1",
-                "snippet": {"scheduledStartTime": "2026-07-10T21:00:00Z"},
-                "contentDetails": {"monitorStream": {"enableMonitorStream": True, "broadcastStreamDelayMs": 0}},
                 "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
             },
         }
