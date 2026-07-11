@@ -370,7 +370,7 @@ def api(method: str, path: str, params: dict[str, str], body: dict[str, Any] | N
 def metric_int(value: Any, field: str) -> int | None:
     if value is None or value == "":
         return None
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int | str):
         raise ReconciliationError(f"invalid {field} metric")
     try:
         parsed = int(value)
@@ -397,10 +397,14 @@ def video_metrics(video_id: str) -> dict[str, Any]:
     item = items[0]
     if str(item.get("id") or "") != video_id:
         raise ReconciliationError("videos.list returned an unexpected video id")
-    live = item.get("liveStreamingDetails") or {}
-    statistics = item.get("statistics") or {}
-    if not isinstance(live, dict) or not isinstance(statistics, dict):
+    live = item.get("liveStreamingDetails")
+    statistics = item.get("statistics")
+    if (live is not None and not isinstance(live, dict)) or (
+        statistics is not None and not isinstance(statistics, dict)
+    ):
         raise ReconciliationError("videos.list returned malformed metrics")
+    live = live or {}
+    statistics = statistics or {}
     return {
         "video_id": video_id,
         "actual_start_time": live.get("actualStartTime"),

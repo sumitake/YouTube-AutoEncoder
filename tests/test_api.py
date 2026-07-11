@@ -1111,12 +1111,27 @@ def test_video_metrics_leaves_absent_optional_values_as_none(load_script, monkey
     assert result["comment_count"] is None
 
 
-@pytest.mark.parametrize("value", [True, False, -1, "-1", "not-a-number"])
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 1.5, 1.0, b"12", [12], {"value": "12"}, -1, "-1", "not-a-number"],
+)
 def test_metric_int_rejects_invalid_counts(load_script, value):
-    api = load_script("youtube-autoencoder-api", f"yta_api_metric_int_{str(value).replace('-', 'n')}")
+    api = load_script("youtube-autoencoder-api", "yta_api_metric_int_invalid")
 
     with pytest.raises(api.ReconciliationError, match="invalid viewCount metric"):
         api.metric_int(value, "viewCount")
+
+
+@pytest.mark.parametrize("section", ["liveStreamingDetails", "statistics"])
+@pytest.mark.parametrize("value", [[], "", 0, False])
+def test_video_metrics_rejects_present_falsy_malformed_sections(load_script, monkeypatch, section, value):
+    api = load_script("youtube-autoencoder-api", "yta_api_video_metrics_malformed_sections")
+    item = {"id": "video-1", "liveStreamingDetails": {}, "statistics": {}}
+    item[section] = value
+    monkeypatch.setattr(api, "api", lambda *_args, **_kwargs: {"items": [item]})
+
+    with pytest.raises(api.ReconciliationError, match="videos.list returned malformed metrics"):
+        api.video_metrics("video-1")
 
 
 def test_video_metrics_rejects_empty_items(load_script, monkeypatch):
