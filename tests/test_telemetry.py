@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import configparser
 import datetime as dt
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import types
 
@@ -14,6 +16,43 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 def repo_text(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def environment_assignments(text: str) -> dict[str, str]:
+    assignments = {}
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        assert separator, f"line {line_number} is not an environment assignment"
+        assert key not in assignments, f"duplicate environment assignment: {key}"
+        assignments[key] = value
+    return assignments
+
+
+def systemd_sections(relative_path: str) -> dict[str, dict[str, str]]:
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    parser.read_string(repo_text(relative_path))
+    return {section: dict(parser[section]) for section in parser.sections()}
+
+
+def workflow_step_run(workflow: str, step_name: str) -> str:
+    lines = workflow.splitlines()
+    marker = f"      - name: {step_name}"
+    start = lines.index(marker)
+    end = next(
+        (index for index in range(start + 1, len(lines)) if lines[index].startswith("      - name: ")),
+        len(lines),
+    )
+    block = lines[start + 1 : end]
+    for index, line in enumerate(block):
+        if line.startswith("        run: |"):
+            return "\n".join(item[10:] for item in block[index + 1 :] if item.startswith("          "))
+        if line.startswith("        run: "):
+            return line.removeprefix("        run: ")
+    raise AssertionError(f"workflow step has no run command: {step_name}")
 
 
 def configure_collector(telemetry, monkeypatch, tmp_path, state):
@@ -526,11 +565,12 @@ def test_retention_days_numeric_values_below_one_clamp_to_one(load_script, monke
 
 def test_telemetry_units_example_config_is_disabled_and_quota_bounded():
     config = repo_text("config/youtube-autoencoder.env.example")
+    assignments = environment_assignments(config)
 
-    assert "YTA_TELEMETRY_ENABLED=false" in config
-    assert "YTA_TELEMETRY_MIN_INTERVAL_SEC=300" in config
-    assert "YTA_TELEMETRY_RETENTION_DAYS=30" in config
-    assert "YTA_TELEMETRY_API=/usr/local/bin/youtube-autoencoder-api" in config
+    assert assignments["YTA_TELEMETRY_ENABLED"] == "false"
+    assert assignments["YTA_TELEMETRY_MIN_INTERVAL_SEC"] == "300"
+    assert assignments["YTA_TELEMETRY_RETENTION_DAYS"] == "30"
+    assert assignments["YTA_TELEMETRY_API"] == "/usr/local/bin/youtube-autoencoder-api"
     assert "Enable exactly one telemetry timer mode" in config
 
 
@@ -552,19 +592,22 @@ def test_telemetry_units_example_config_is_disabled_and_quota_bounded():
     ],
 )
 def test_telemetry_units_services_are_isolated_oneshots(path, environment_file, working_directory, user_line):
-    service = repo_text(path)
-
-    assert "Type=oneshot" in service
-    assert f"EnvironmentFile={environment_file}" in service
-    assert "ExecStart=/usr/local/bin/youtube-autoencoder-telemetry" in service
-    assert f"WorkingDirectory={working_directory}" in service
-    assert "Nice=10" in service
-    assert "IOSchedulingClass=idle" in service
+    sections = systemd_sections(path)
+    expected_service = {
+        "Type": "oneshot",
+        "EnvironmentFile": environment_file,
+        "ExecStart": "/usr/local/bin/youtube-autoencoder-telemetry",
+        "WorkingDirectory": working_directory,
+        "Nice": "10",
+        "IOSchedulingClass": "idle",
+    }
     if user_line is not None:
-        assert user_line in service
-    assert "youtube-autoencoder@" not in service
-    assert "youtube-autoencoder.service" not in service
-    assert "Restart=" not in service
+        key, value = user_line.split("=", maxsplit=1)
+        expected_service[key] = value
+    assert sections["Service"] == expected_service
+    all_values = {value for section in sections.values() for value in section.values()}
+    assert not any("youtube-autoencoder@" in value for value in all_values)
+    assert "youtube-autoencoder.service" not in all_values
 
 
 @pytest.mark.parametrize(
@@ -575,15 +618,17 @@ def test_telemetry_units_services_are_isolated_oneshots(path, environment_file, 
     ],
 )
 def test_telemetry_units_timers_have_exact_nonpersistent_cadence(path, service_unit):
-    timer = repo_text(path)
+    sections = systemd_sections(path)
 
-    assert "OnBootSec=5min" in timer
-    assert "OnUnitActiveSec=5min" in timer
-    assert "AccuracySec=30s" in timer
-    assert "RandomizedDelaySec=30s" in timer
-    assert "Persistent=false" in timer
-    assert f"Unit={service_unit}" in timer
-    assert "WantedBy=timers.target" in timer
+    assert sections["Timer"] == {
+        "OnBootSec": "5min",
+        "OnUnitActiveSec": "5min",
+        "AccuracySec": "30s",
+        "RandomizedDelaySec": "30s",
+        "Persistent": "false",
+        "Unit": service_unit,
+    }
+    assert sections["Install"] == {"WantedBy": "timers.target"}
 
 
 def test_telemetry_units_do_not_couple_existing_encoder_services():
@@ -593,15 +638,40 @@ def test_telemetry_units_do_not_couple_existing_encoder_services():
 
 def test_telemetry_units_ci_validates_collector_and_all_units():
     workflow = repo_text(".github/workflows/ci.yml")
+    compile_command = shlex.split(workflow_step_run(workflow, "Compile scripts"))
+    executable_commands = workflow_step_run(workflow, "Verify executable scripts").splitlines()
+    systemd_command = workflow_step_run(workflow, "Verify systemd units")
+    systemd_lines = systemd_command.splitlines()
+    verify_start = systemd_lines.index("systemd-analyze verify \\")
+    verify_command = shlex.split(" ".join(line.removesuffix(" \\") for line in systemd_lines[verify_start:]))
 
-    assert "bin/youtube-autoencoder-telemetry" in workflow
-    assert "sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-autoencoder-telemetry" in workflow
-    for unit in (
+    assert compile_command == [
+        "python",
+        "-m",
+        "py_compile",
+        "bin/youtube-autoencoder",
+        "bin/youtube-autoencoder-api",
+        "bin/youtube-autoencoder-test-pattern",
+        "bin/youtube-autoencoder-telemetry",
+    ]
+    assert executable_commands == [
+        "test -x bin/youtube-autoencoder",
+        "test -x bin/youtube-autoencoder-api",
+        "test -x bin/youtube-autoencoder-test-pattern",
+        "test -x bin/youtube-autoencoder-telemetry",
+    ]
+    assert systemd_lines[:2] == [
+        "sudo install -m 0755 bin/youtube-autoencoder /usr/local/bin/youtube-autoencoder",
+        "sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-autoencoder-telemetry",
+    ]
+    assert verify_command == [
+        "systemd-analyze",
+        "verify",
         "systemd/youtube-autoencoder@.service",
         "systemd/youtube-autoencoder-telemetry@.service",
         "systemd/youtube-autoencoder-telemetry@.timer",
         "systemd/user/youtube-autoencoder.service",
         "systemd/user/youtube-autoencoder-telemetry.service",
         "systemd/user/youtube-autoencoder-telemetry.timer",
-    ):
-        assert unit in workflow
+    ]
+    assert "systemctl" not in workflow
