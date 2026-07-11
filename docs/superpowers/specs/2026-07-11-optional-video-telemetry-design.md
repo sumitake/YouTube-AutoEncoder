@@ -1,6 +1,6 @@
 # Optional Video Telemetry Design
 
-**Status:** Design approved; written specification pending review  
+**Status:** Approved for implementation
 **Date:** 2026-07-11  
 **Project:** YouTube AutoEncoder
 
