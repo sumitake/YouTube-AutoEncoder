@@ -202,6 +202,48 @@ This verifies the YouTube account, OAuth token, reusable stream, ingest URL, bro
 
 ## Installation
 
+Provision the YouTube control plane and the encoder host in this order. The detailed console steps and commands remain in the sections that follow.
+
+```mermaid
+flowchart TD
+    DeploymentChannel["Enable YouTube Live on the target channel"]
+    DeploymentProject["Enable YouTube Data API v3"]
+    DeploymentAudience["Configure a compatible OAuth audience"]
+    DeploymentClient["Create a TV or Limited Input OAuth client"]
+    DeploymentRuntime["Install FFmpeg, Python, and project scripts"]
+    DeploymentConfig["Create private encoder and OAuth files"]
+    DeploymentAuthorize["Authorize the channel account"]
+    DeploymentCamera["Configure camera source and ingest profile"]
+    DeploymentStreamDecision{"Reusable stream already configured?"}
+    DeploymentProvision["Run visible test with --create-stream"]
+    DeploymentValidate["Run unlisted visible validation"]
+    DeploymentValidationDecision{"Validation succeeds?"}
+    DeploymentDiagnose["Fix OAuth, source, ingest, or quota issue"]
+    DeploymentEnable["Enable the systemd service"]
+    DeploymentReboot["Reboot the encoder host"]
+    DeploymentVerify["Verify encoder and remote-management recovery"]
+    DeploymentOperate["Unattended operation"]
+
+    DeploymentChannel --> DeploymentProject
+    DeploymentProject --> DeploymentAudience
+    DeploymentAudience --> DeploymentClient
+    DeploymentClient --> DeploymentRuntime
+    DeploymentRuntime --> DeploymentConfig
+    DeploymentConfig --> DeploymentAuthorize
+    DeploymentAuthorize --> DeploymentCamera
+    DeploymentCamera --> DeploymentStreamDecision
+    DeploymentStreamDecision -->|"No"| DeploymentProvision
+    DeploymentProvision --> DeploymentValidate
+    DeploymentStreamDecision -->|"Yes"| DeploymentValidate
+    DeploymentValidate --> DeploymentValidationDecision
+    DeploymentValidationDecision -->|"No"| DeploymentDiagnose
+    DeploymentDiagnose --> DeploymentValidate
+    DeploymentValidationDecision -->|"Yes"| DeploymentEnable
+    DeploymentEnable --> DeploymentReboot
+    DeploymentReboot --> DeploymentVerify
+    DeploymentVerify --> DeploymentOperate
+```
+
 Install runtime packages:
 
 ```bash
