@@ -607,7 +607,7 @@ def test_telemetry_units_services_are_isolated_oneshots(path, environment_file, 
     assert sections["Service"] == expected_service
     all_values = {value for section in sections.values() for value in section.values()}
     assert not any("youtube-autoencoder@" in value for value in all_values)
-    assert "youtube-autoencoder.service" not in all_values
+    assert not any("youtube-autoencoder.service" in value for value in all_values)
 
 
 @pytest.mark.parametrize(
