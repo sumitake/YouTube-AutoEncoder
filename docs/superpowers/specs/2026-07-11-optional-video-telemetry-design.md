@@ -46,7 +46,7 @@ The following controls are mandatory:
 - `YTA_TELEMETRY_MIN_INTERVAL_SEC` defaults to `300` and is clamped to a minimum of `300`.
 - A write-ahead `last_attempt_at` timestamp is persisted locally and checked before the API helper starts.
 - The timer is non-persistent, so host downtime does not produce catch-up calls.
-- At the minimum interval, a continuously live broadcast can consume no more than 288 `videos.list` units in any 24-hour period.
+- With one timer mode active, a continuously live broadcast can consume no more than 288 `videos.list` units in any 24-hour period at the minimum interval.
 
 Invalid requests still consume quota, so all local eligibility checks occur before invoking the API helper.
 
@@ -184,7 +184,7 @@ RandomizedDelaySec=30s
 Persistent=false
 ```
 
-The timer units have normal install targets but are not enabled by installation commands. Operators opt in only after setting:
+The timer units have normal install targets but are not enabled by installation commands. System and user timers are alternative activation modes; operators must enable exactly one for a deployment. Operators opt in only after setting:
 
 ```text
 YTA_TELEMETRY_ENABLED=true
@@ -254,8 +254,9 @@ Repository validation will add the collector to Ruff, `py_compile`, executable-b
 
 The README and Raspberry Pi deployment guide will document:
 
-- The quota-only cost model and 288-unit maximum at the default cadence.
+- The quota-only cost model and 288-unit maximum at the default cadence with one timer mode active.
 - The disabled-by-default two-step opt-in.
+- The requirement to choose either the system timer or the user timer, never both.
 - Storage paths, retention, inspection commands, and disable commands.
 - The fact that telemetry is descriptive and never part of recovery.
 - The current `videos.list` metric limitations, including nullable concurrent viewers.
@@ -280,7 +281,7 @@ Rollback removes the new telemetry executable and units, restores the prior API 
 
 - The repository exposes a tested `video-metrics` command backed by one `videos.list` request.
 - Telemetry is disabled by default and makes zero calls in disabled or ineligible states.
-- Enabled telemetry makes at most one call per 300 seconds, including failed attempts, and therefore no more than 288 calls per 24 hours.
+- Enabled telemetry with one timer mode active makes at most one call per 300 seconds, including failed attempts, and therefore no more than 288 calls per 24 hours.
 - Telemetry uses no paid service, new OAuth scope, third-party runtime package, or external storage.
 - Telemetry failure cannot affect FFmpeg, broadcast lifecycle, visibility, retry state, or service restart behavior.
 - Local samples are private, durable, bounded by retention, and contain no credentials.

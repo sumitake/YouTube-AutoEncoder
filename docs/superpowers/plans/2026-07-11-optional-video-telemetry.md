@@ -14,7 +14,7 @@
 - `YTA_TELEMETRY_ENABLED` defaults to `false`; installation and Pi deployment leave all telemetry timers disabled.
 - A collector invocation performs zero API calls unless the cached broadcast is `live`, has an ID, is outside lifecycle cooldown, and is outside the telemetry minimum interval.
 - Clamp `YTA_TELEMETRY_MIN_INTERVAL_SEC` to at least `300`; persist `last_attempt_at` before the API subprocess so failed calls and crashes remain throttled.
-- A continuously live timer-driven deployment consumes at most 288 `videos.list` quota units in 24 hours at the default cadence.
+- A continuously live deployment with one timer mode active consumes at most 288 `videos.list` quota units in 24 hours at the default cadence.
 - Telemetry cannot invoke or influence FFmpeg, broadcast reconciliation, lifecycle transitions, privacy changes, retry mutation, or encoder service restart behavior.
 - Use private `0700` directories and `0600` files; never log credentials, URLs, environments, arbitrary helper output, or source data.
 - Use TDD for every runtime behavior: write the focused test, verify the expected failure, implement the minimum behavior, and verify green before proceeding.
@@ -355,6 +355,7 @@ Add tests that read repository files and assert:
 
 - Services are `Type=oneshot`, execute `/usr/local/bin/youtube-autoencoder-telemetry`, and use the existing environment-file paths.
 - Timers use `OnBootSec=5min`, `OnUnitActiveSec=5min`, `AccuracySec=30s`, `RandomizedDelaySec=30s`, and `Persistent=false`.
+- System and user timers are documented as alternative modes that must not both be enabled for one deployment.
 - No encoder unit references telemetry.
 - Example config uses `YTA_TELEMETRY_ENABLED=false`, interval `300`, retention `30`, and helper path.
 
@@ -462,11 +463,11 @@ and user service enablement:
 systemctl --user enable --now youtube-autoencoder-telemetry.timer
 ```
 
-Require `YTA_TELEMETRY_ENABLED=true` first. Include inspection of `latest.json`, daily JSONL, timer status, and corresponding disable commands.
+Require `YTA_TELEMETRY_ENABLED=true` first and explicitly require choosing only one timer mode. Include inspection of `latest.json`, daily JSONL, timer status, and corresponding disable commands.
 
 - [ ] **Step 3: Document cost and isolation**
 
-State that telemetry uses one quota unit per eligible collection, at most 288 units per 24 hours at the minimum cadence, and adds no paid service. Explain nullable current viewers and that telemetry never controls recovery.
+State that telemetry uses one quota unit per eligible collection, at most 288 units per 24 hours at the minimum cadence when one timer mode is active, and adds no paid service. Explain nullable current viewers and that telemetry never controls recovery.
 
 - [ ] **Step 4: Update architecture and changelog**
 
