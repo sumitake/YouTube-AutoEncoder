@@ -233,7 +233,7 @@ flowchart TD
     DeploymentAudience["Configure a compatible OAuth audience"]
     DeploymentClient["Create a TV or Limited Input OAuth client"]
     DeploymentRuntime["Install FFmpeg, Python, and project scripts"]
-    DeploymentConfig["Create private encoder and OAuth files"]
+    DeploymentConfig["Create private encoder, OAuth, and writable service files"]
     DeploymentAuthorize["Authorize the channel account"]
     DeploymentCamera["Configure camera source and ingest profile"]
     DeploymentStreamDecision{"Reusable stream already configured?"}
@@ -259,7 +259,7 @@ flowchart TD
     DeploymentStreamDecision -->|"Yes"| DeploymentValidate
     DeploymentValidate --> DeploymentValidationDecision
     DeploymentValidationDecision -->|"No"| DeploymentDiagnose
-    DeploymentDiagnose --> DeploymentValidate
+    DeploymentDiagnose --> DeploymentStreamDecision
     DeploymentValidationDecision -->|"Yes"| DeploymentEnable
     DeploymentEnable --> DeploymentReboot
     DeploymentReboot --> DeploymentVerify
@@ -276,7 +276,7 @@ test "$(rg -c '^```mermaid$' README.md)" -eq 3
 test "$(rg -c '^flowchart TB$' README.md)" -eq 1
 test "$(rg -c '^flowchart TD$' README.md)" -eq 1
 test "$(rg -c '^stateDiagram-v2$' README.md)" -eq 1
-rg -n 'DeploymentStreamDecision|DeploymentValidationDecision|remote-management recovery' README.md
+rg -n 'DeploymentStreamDecision|DeploymentValidationDecision|DeploymentDiagnose --> DeploymentStreamDecision|remote-management recovery' README.md
 git diff --check
 ```
 

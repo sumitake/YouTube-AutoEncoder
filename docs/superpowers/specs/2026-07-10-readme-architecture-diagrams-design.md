@@ -82,7 +82,7 @@ Format: Mermaid `flowchart TD` covering:
 3. Configure an External or otherwise compatible OAuth audience.
 4. Create a TV or Limited Input OAuth client.
 5. Install FFmpeg, Python, and project scripts.
-6. Create private configuration and OAuth files.
+6. Create private configuration, OAuth, and writable service files.
 7. Authorize the channel account and persist the refresh token.
 8. Configure the camera and reusable ingest stream.
 9. Run the visible unlisted validation flow.
@@ -94,6 +94,8 @@ Decision nodes will identify the two operator-significant branches:
 
 - Existing reusable stream versus provisioning one with `--create-stream`.
 - Validation failure versus successful service enablement.
+
+The detailed README text will state that `--create-stream` requires an existing writable OBS service file with a non-empty placeholder key. A validation failure returns to the reusable-stream decision so provisioning is retried when the prior attempt did not create a stream.
 
 The existing numbered OAuth section remains the source of command and console detail.
 

@@ -207,7 +207,7 @@ flowchart TD
     DeploymentAudience["Configure a compatible OAuth audience"]
     DeploymentClient["Create a TV or Limited Input OAuth client"]
     DeploymentRuntime["Install FFmpeg, Python, and project scripts"]
-    DeploymentConfig["Create private encoder and OAuth files"]
+    DeploymentConfig["Create private encoder, OAuth, and writable service files"]
     DeploymentAuthorize["Authorize the channel account"]
     DeploymentCamera["Configure camera source and ingest profile"]
     DeploymentStreamDecision{"Reusable stream already configured?"}
@@ -233,7 +233,7 @@ flowchart TD
     DeploymentStreamDecision -->|"Yes"| DeploymentValidate
     DeploymentValidate --> DeploymentValidationDecision
     DeploymentValidationDecision -->|"No"| DeploymentDiagnose
-    DeploymentDiagnose --> DeploymentValidate
+    DeploymentDiagnose --> DeploymentStreamDecision
     DeploymentValidationDecision -->|"Yes"| DeploymentEnable
     DeploymentEnable --> DeploymentReboot
     DeploymentReboot --> DeploymentVerify
@@ -318,7 +318,17 @@ YTA_OBS_SCENE_FILE=/home/encoder/.config/obs-studio/basic/scenes/Untitled.json
 YTA_OBS_SOURCE_NAME=Camera RTSP
 ```
 
-The OBS service file supplies the reusable YouTube RTMPS server and stream key. A fresh reusable stream can be provisioned by running the visible test with `--create-stream`; the helper then updates this file before starting the test encoder.
+The OBS service file supplies the reusable YouTube RTMPS server and stream key. It must exist, be writable by the service user, and contain a non-empty `settings.key` before `--create-stream` runs. For a fresh deployment, keep the service disabled and seed a placeholder key:
+
+```json
+{
+  "settings": {
+    "key": "provision-new-stream"
+  }
+}
+```
+
+The placeholder is not a YouTube stream key. `--create-stream` uses it to confirm that no existing stream matches, then replaces it with the new reusable stream key and writes the ingest server before starting the test encoder. A missing file or empty key does not enter the creation path.
 
 ## YouTube API and OAuth Provisioning
 
@@ -431,7 +441,7 @@ If you already have an OBS-compatible `service.json` with a YouTube stream key:
 youtube-autoencoder-api status
 ```
 
-For a fresh setup, make sure the service user can write the configured OBS service file. Then provision the reusable stream through an API-managed visible test after the rest of the encoder config is in place:
+For a fresh setup, create the writable OBS service file with the placeholder `settings.key` shown in the Configuration Model. Then provision the reusable stream through an API-managed visible test after the rest of the encoder config is in place:
 
 ```bash
 YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
