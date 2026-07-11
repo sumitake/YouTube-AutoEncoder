@@ -28,27 +28,51 @@ The intended outcome is an appliance-like encoder that can be deployed on a Rasp
 
 ## Architecture
 
-```text
-camera -> FFprobe -> FFmpeg -> reusable YouTube ingest
-                         |                 |
-                         | progress        | stream health
-                         v                 v
-                 youtube-autoencoder supervisor
-                         |
-                         | bounded JSON commands
-                         v
-                 youtube-autoencoder-api
-                         |
-          OAuth, reconciliation, transitions, privacy
-                         |
-                         v
-                  YouTube Data API v3
-                         |
-                         v
-            one marked YouTube Live broadcast
+```mermaid
+flowchart LR
+    subgraph ArchitectureInputs["Source and compatibility inputs"]
+        Camera["RTSP camera"]
+        ObsScene["Optional OBS scene"]
+        ObsService["Optional OBS service profile"]
+    end
+
+    subgraph ArchitectureHost["Encoder host"]
+        Systemd["systemd service"]
+        Supervisor["youtube-autoencoder supervisor"]
+        Probe["FFprobe source validation"]
+        Encoder["FFmpeg media pipeline"]
+        Helper["youtube-autoencoder-api"]
+        State["Durable state and locks"]
+        OAuth["OAuth client and token"]
+    end
+
+    subgraph ArchitectureYouTube["YouTube"]
+        Ingest["Reusable liveStream ingest"]
+        Api["YouTube Data API v3"]
+        Broadcast["One marked liveBroadcast and watch page"]
+    end
+
+    Systemd -->|"start and restart"| Supervisor
+    ObsScene -->|"source discovery"| Supervisor
+    ObsService -->|"ingest compatibility"| Supervisor
+    Supervisor -->|"probe"| Probe
+    Camera -->|"RTSP media"| Probe
+    Probe -->|"source health"| Supervisor
+    Supervisor -->|"spawn and supervise"| Encoder
+    Camera -->|"video"| Encoder
+    Encoder -->|"progress"| Supervisor
+    Encoder -->|"RTMPS media"| Ingest
+    Supervisor -->|"bounded JSON commands"| Helper
+    Helper <-->|"read and write"| State
+    OAuth -->|"authorization"| Helper
+    Helper <-->|"lifecycle and health"| Api
+    Ingest -->|"stream health"| Api
+    Api <-->|"create, bind, transition, verify"| Broadcast
 ```
 
 The supervisor owns local process health, polling, backoff, and publication timing. The API helper owns OAuth, remote resource reconciliation, durable lifecycle state, and serialized mutations. YouTube remains authoritative; the local state file is a recovery cache and is revalidated before mutations.
+
+For the detailed reconciliation algorithm, lifecycle states, and test strategy, see the [idempotent lifecycle recovery design](docs/superpowers/specs/2026-07-10-idempotent-youtube-lifecycle-design.md).
 
 ### Components
 
