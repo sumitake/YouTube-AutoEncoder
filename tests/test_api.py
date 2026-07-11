@@ -519,6 +519,216 @@ def test_reconcile_refuses_create_until_ingest_is_active(load_script, monkeypatc
         )
 
 
+def test_offline_reconcile_stages_one_unlisted_broadcast_before_ingest(
+    load_script, monkeypatch, tmp_path
+):
+    api = load_script("youtube-autoencoder-api", "yta_api_offline_stage")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        api,
+        "stream_by_id",
+        lambda stream_id: {"id": stream_id, "status": {"streamStatus": "inactive"}},
+    )
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [], raising=False)
+    generation = "00000000-0000-0000-0000-000000000001"
+    created = managed_broadcast(api, "broadcast-1", "created", generation=generation, stream_id="")
+    bound = managed_broadcast(api, "broadcast-1", "ready", generation=generation)
+    creates = []
+    monkeypatch.setattr(api.uuid, "uuid4", lambda: uuid.UUID(generation))
+
+    def create(title, privacy, description=None):
+        creates.append((title, privacy, description))
+        return created
+
+    monkeypatch.setattr(api, "create_broadcast", create)
+    monkeypatch.setattr(api, "bind_broadcast", lambda _broadcast_id, _stream_id: bound)
+
+    state = api.reconcile_broadcast(
+        stream_id="stream-1",
+        title="Camera Live",
+        staging_privacy="unlisted",
+        allow_create=True,
+        offline_create=True,
+    )
+
+    assert len(creates) == 1
+    assert state["generation_id"] == generation
+    assert state["broadcast_id"] == "broadcast-1"
+    assert state["privacy"] == "unlisted"
+
+
+def test_offline_reconcile_blocks_unmarked_broadcast_bound_to_same_stream(
+    load_script, monkeypatch, tmp_path
+):
+    api = load_script("youtube-autoencoder-api", "yta_api_offline_unmarked_conflict")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    unmarked = {
+        "id": "legacy-broadcast",
+        "snippet": {"title": "Legacy Live", "description": "Created outside AutoEncoder."},
+        "contentDetails": {"boundStreamId": "stream-1", "enableAutoStart": True},
+        "status": {"lifeCycleStatus": "ready", "privacyStatus": "unlisted"},
+    }
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [unmarked], raising=False)
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
+
+    with pytest.raises(api.ReconciliationError, match="unmarked"):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+
+def test_offline_reconcile_checks_unmarked_conflicts_with_cached_managed_broadcast(
+    load_script, monkeypatch, tmp_path
+):
+    api = load_script("youtube-autoencoder-api", "yta_api_offline_cached_conflict")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    api.write_state(
+        {
+            "schema_version": 2,
+            "instance_id": "encoder-1",
+            "generation_id": "generation-1",
+            "stream_id": "stream-1",
+            "broadcast_id": "broadcast-1",
+        }
+    )
+    cached = managed_broadcast(api, "broadcast-1", "ready")
+    unmarked = {
+        "id": "legacy-broadcast",
+        "snippet": {"title": "Legacy Live", "description": "Created outside AutoEncoder."},
+        "contentDetails": {"boundStreamId": "stream-1", "enableAutoStart": True},
+        "status": {"lifeCycleStatus": "ready", "privacyStatus": "unlisted"},
+    }
+    monkeypatch.setattr(api, "broadcast_by_id", lambda _broadcast_id: cached)
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [cached, unmarked])
+
+    with pytest.raises(api.ReconciliationError, match="unmarked"):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+
+def test_offline_reconcile_refuses_public_staging(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_offline_public")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [])
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
+
+    with pytest.raises(api.ReconciliationError, match="unlisted"):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="public",
+            allow_create=True,
+            offline_create=True,
+        )
+
+
+def test_offline_insert_throttle_preserves_write_ahead_generation(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_offline_insert_throttle")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    api.write_state(
+        {
+            "schema_version": 2,
+            "instance_id": "encoder-1",
+            "generation_id": "generation-1",
+            "stream_id": "stream-1",
+            "broadcast_id": None,
+            "pending_action": "create",
+        }
+    )
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [])
+    creates = []
+
+    def throttled_insert(*_args, **_kwargs):
+        creates.append(True)
+        raise api.YouTubeApiError(
+            status=403,
+            reasons=("userRequestsExceedRateLimit",),
+            message="User requests exceed the rate limit.",
+        )
+
+    monkeypatch.setattr(api, "create_broadcast", throttled_insert)
+
+    with pytest.raises(api.YouTubeApiError):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+    state = api.read_state()
+    assert creates == [True]
+    assert state["generation_id"] == "generation-1"
+    assert state["broadcast_id"] is None
+    assert state["pending_action"] == "create"
+
+
+def test_offline_bind_failure_reuses_persisted_broadcast_without_reinsert(
+    load_script, monkeypatch, tmp_path
+):
+    api = load_script("youtube-autoencoder-api", "yta_api_offline_bind_retry")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    generation = "00000000-0000-0000-0000-000000000001"
+    created = managed_broadcast(api, "broadcast-1", "created", generation=generation, stream_id="")
+    bound = managed_broadcast(api, "broadcast-1", "ready", generation=generation)
+    inventory = []
+    creates = []
+    monkeypatch.setattr(api.uuid, "uuid4", lambda: uuid.UUID(generation))
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: list(inventory))
+
+    def create(*_args, **_kwargs):
+        creates.append(True)
+        inventory[:] = [created]
+        return created
+
+    monkeypatch.setattr(api, "create_broadcast", create)
+    monkeypatch.setattr(
+        api,
+        "bind_broadcast",
+        lambda *_args: (_ for _ in ()).throw(ConnectionError("bind failed")),
+    )
+
+    with pytest.raises(ConnectionError, match="bind failed"):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+    pending = api.read_state()
+    assert pending["broadcast_id"] == "broadcast-1"
+    assert pending["pending_action"] == "bind"
+
+    monkeypatch.setattr(api, "broadcast_by_id", lambda _broadcast_id: created)
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("second insert called"))
+    monkeypatch.setattr(api, "bind_broadcast", lambda *_args: bound)
+
+    recovered = api.reconcile_broadcast(
+        stream_id="stream-1",
+        title="Camera Live",
+        staging_privacy="unlisted",
+        allow_create=True,
+        offline_create=True,
+    )
+
+    assert creates == [True]
+    assert recovered["broadcast_id"] == "broadcast-1"
+    assert recovered["pending_action"] is None
+    assert recovered["lifecycle"] == "ready"
+
+
 def test_list_managed_broadcasts_requires_exact_marker(load_script, monkeypatch):
     api = load_script("youtube-autoencoder-api", "yta_api_exact_marker")
     exact = managed_broadcast(api, "broadcast-1", "ready")
@@ -594,6 +804,18 @@ def test_set_privacy_command_reuses_verified_readback(load_script, monkeypatch, 
     assert output["privacy"] == "public"
 
 
+def test_missing_broadcast_status_disables_cached_public_fallback(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_missing_broadcast_status")
+    monkeypatch.setattr(api, "broadcast_by_id", lambda _broadcast_id: None)
+
+    with pytest.raises(api.ReconciliationError, match="not found") as raised:
+        api.broadcast_status("missing-broadcast")
+
+    payload = api.error_payload(raised.value)
+    assert payload["retry_class"] == "ambiguous"
+    assert payload["public_fallback_allowed"] is False
+
+
 def test_retry_state_updates_preserve_broadcast_identity(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_retry_state")
     configure_reconciliation(api, monkeypatch, tmp_path)
@@ -643,6 +865,55 @@ def test_prepare_broadcast_uses_reconciliation_not_direct_insert(load_script, mo
 
     assert api.prepare_broadcast(args) == 0
     assert json.loads(capsys.readouterr().out)["broadcast_id"] == "broadcast-1"
+
+
+def test_reconcile_command_forwards_explicit_offline_create(load_script, monkeypatch, capsys):
+    api = load_script("youtube-autoencoder-api", "yta_api_reconcile_offline_command")
+    args = argparse.Namespace(
+        allow_create=True,
+        offline_create=True,
+        create_stream=False,
+        title="Camera Live",
+        title_prefix="AutoEncoder Live",
+        privacy="unlisted",
+    )
+    captured = {}
+    monkeypatch.setattr(api, "ensure_stream", lambda create_if_missing: {"id": "stream-1"})
+
+    def reconcile(**kwargs):
+        captured.update(kwargs)
+        return {
+            "broadcast_id": "broadcast-1",
+            "stream_id": kwargs["stream_id"],
+            "lifecycle": "ready",
+            "privacy": kwargs["staging_privacy"],
+        }
+
+    monkeypatch.setattr(api, "reconcile_broadcast", reconcile)
+
+    assert api.reconcile_command(args) == 0
+    assert json.loads(capsys.readouterr().out)["broadcast_id"] == "broadcast-1"
+    assert captured["offline_create"] is True
+
+
+def test_reconcile_parser_accepts_explicit_offline_create(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_reconcile_offline_parser")
+    captured = {}
+    monkeypatch.setattr(
+        api.sys,
+        "argv",
+        ["youtube-autoencoder-api", "reconcile-broadcast", "--allow-create", "--offline-create"],
+    )
+
+    def command(args):
+        captured["allow_create"] = args.allow_create
+        captured["offline_create"] = args.offline_create
+        return 0
+
+    monkeypatch.setattr(api, "reconcile_command", command)
+
+    assert api.main() == 0
+    assert captured == {"allow_create": True, "offline_create": True}
 
 
 def test_transition_command_serializes_mutation(load_script, monkeypatch, capsys):

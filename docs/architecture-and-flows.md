@@ -63,22 +63,22 @@ Recovery preserves ownership, retries through durable cooldowns, and replaces an
 stateDiagram-v2
     state "Startup or restart" as RecoveryStartup
     state "Managed stream generation" as RecoveryGeneration {
-        state "Probe source and start FFmpeg" as RecoveryMedia
-        state "Require fresh active ingest" as RecoveryIngest
+        state "Probe camera source" as RecoveryProbe
         state "Reconcile exact ownership markers" as RecoveryReconcile
         state "Create and bind unlisted generation" as RecoveryCreate
         state "Resume one nonterminal event" as RecoveryManaged
+        state "Start FFmpeg and require active ingest" as RecoveryMedia
         state "Testing, live, and publication gates" as RecoveryGates
         state "Verified public stream" as RecoveryStable
         state "Public stream with API cooldown" as RecoveryPublicFallback
 
-        [*] --> RecoveryMedia
-        RecoveryMedia --> RecoveryIngest : media progress fresh
-        RecoveryIngest --> RecoveryReconcile : YouTube ingest active
+        [*] --> RecoveryProbe
+        RecoveryProbe --> RecoveryReconcile : source available
         RecoveryReconcile --> RecoveryManaged : one marked nonterminal event
         RecoveryReconcile --> RecoveryCreate : none, terminal, or missing
         RecoveryCreate --> RecoveryManaged : insert and bind verified
-        RecoveryManaged --> RecoveryGates
+        RecoveryManaged --> RecoveryMedia : ownership and binding durable
+        RecoveryMedia --> RecoveryGates : media fresh and ingest active
         RecoveryGates --> RecoveryStable : two healthy live observations and privacy readback
         RecoveryStable --> RecoveryPublicFallback : API unavailable, media healthy
         RecoveryPublicFallback --> RecoveryStable : API recovers

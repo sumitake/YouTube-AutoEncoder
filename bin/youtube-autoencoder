@@ -73,21 +73,32 @@ class ApiCommandError(RuntimeError):
         self,
         *,
         returncode: int,
+        operation: str | None = None,
         payload: dict[str, Any] | None = None,
         output: str = "",
     ) -> None:
         self.returncode = returncode
+        self.operation = operation
         self.payload = payload or {}
         self.http_status = self.payload.get("http_status")
         self.reasons = tuple(str(reason) for reason in self.payload.get("reasons") or [])
         self.retry_class = str(self.payload.get("retry_class") or "fatal")
+        self.public_fallback_allowed = self.payload.get("public_fallback_allowed") is not False
         retry_after = self.payload.get("retry_after")
         try:
             self.retry_after = float(retry_after) if retry_after is not None else None
         except (TypeError, ValueError):
             self.retry_after = None
         message = str(self.payload.get("message") or output or "YouTube API helper failed")
-        super().__init__(redact_text(message))
+        details = []
+        if operation:
+            details.append(f"operation={operation}")
+        if self.http_status is not None:
+            details.append(f"http_status={self.http_status}")
+        if self.reasons:
+            details.append(f"reasons={','.join(self.reasons)}")
+        suffix = f" ({' '.join(details)})" if details else ""
+        super().__init__(redact_text(message + suffix))
 
 
 @dataclasses.dataclass
@@ -401,11 +412,17 @@ def json_object_from_output(output: str) -> dict[str, Any] | None:
     return None
 
 
-def parse_api_result(returncode: int, stdout: str, stderr: str) -> dict[str, Any]:
+def parse_api_result(
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    *,
+    operation: str | None = None,
+) -> dict[str, Any]:
     if returncode != 0:
         payload = json_object_from_output(stderr) or json_object_from_output(stdout)
         output = (stdout + "\n" + stderr).strip()
-        raise ApiCommandError(returncode=returncode, payload=payload, output=output)
+        raise ApiCommandError(returncode=returncode, operation=operation, payload=payload, output=output)
     output = stdout.strip()
     if not output:
         return {}
@@ -414,11 +431,13 @@ def parse_api_result(returncode: int, stdout: str, stderr: str) -> dict[str, Any
     except json.JSONDecodeError as exc:
         raise ApiCommandError(
             returncode=returncode,
+            operation=operation,
             payload={"message": f"YouTube API helper returned invalid JSON: {exc}", "retry_class": "fatal"},
         ) from exc
     if not isinstance(value, dict):
         raise ApiCommandError(
             returncode=returncode,
+            operation=operation,
             payload={"message": "YouTube API helper did not return a JSON object", "retry_class": "fatal"},
         )
     return value
@@ -426,11 +445,13 @@ def parse_api_result(returncode: int, stdout: str, stderr: str) -> dict[str, Any
 
 def api_command(args: list[str], *, timeout: int = 90) -> dict[str, Any]:
     cmd = [env("YTA_YOUTUBE_API", "youtube-autoencoder-api"), *args]
+    operation = args[0] if args else None
     try:
         result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise ApiCommandError(
             returncode=-1,
+            operation=operation,
             payload={
                 "message": f"YouTube API command timed out after {timeout}s",
                 "retry_class": "api",
@@ -439,9 +460,10 @@ def api_command(args: list[str], *, timeout: int = 90) -> dict[str, Any]:
     except OSError as exc:
         raise ApiCommandError(
             returncode=-1,
+            operation=operation,
             payload={"message": f"could not start YouTube API helper: {exc}", "retry_class": "fatal"},
         ) from exc
-    return parse_api_result(result.returncode, result.stdout, result.stderr)
+    return parse_api_result(result.returncode, result.stdout, result.stderr, operation=operation)
 
 
 def ffmpeg_args(
@@ -582,6 +604,7 @@ def api_command_while_streaming(
     timeout: int,
 ) -> dict[str, Any]:
     cmd = [env("YTA_YOUTUBE_API", "youtube-autoencoder-api"), *args]
+    operation = args[0] if args else None
     with (
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout_file,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file,
@@ -596,6 +619,7 @@ def api_command_while_streaming(
         except OSError as exc:
             raise ApiCommandError(
                 returncode=-1,
+                operation=operation,
                 payload={"message": f"could not start YouTube API helper: {exc}", "retry_class": "fatal"},
             ) from exc
         deadline = time.monotonic() + timeout
@@ -607,6 +631,7 @@ def api_command_while_streaming(
                 if time.monotonic() >= deadline:
                     raise ApiCommandError(
                         returncode=-1,
+                        operation=operation,
                         payload={
                             "message": f"YouTube API command timed out after {timeout}s",
                             "retry_class": "api",
@@ -622,7 +647,7 @@ def api_command_while_streaming(
         except BaseException:
             stop_process(api_process)
             raise
-    return parse_api_result(api_process.returncode, stdout, stderr)
+    return parse_api_result(api_process.returncode, stdout, stderr, operation=operation)
 
 
 def poll_interval() -> float:
@@ -662,6 +687,17 @@ def current_observation(runtime: StreamRuntime, state: dict[str, Any]) -> dict[s
     ensure_encoder_running(runtime)
     stream = api_command_while_streaming(["stream-status", stream_id], runtime, timeout=45)
     broadcast = api_command_while_streaming(["broadcast-status", broadcast_id], runtime, timeout=45)
+    bound_stream_id = str(broadcast.get("bound_stream_id") or "")
+    if bound_stream_id != stream_id:
+        raise ApiCommandError(
+            returncode=78,
+            operation="broadcast-status",
+            payload={
+                "message": f"managed broadcast is bound to a different stream: {bound_stream_id or '<empty>'}",
+                "retry_class": "ambiguous",
+                "public_fallback_allowed": False,
+            },
+        )
     ensure_encoder_running(runtime)
     return {
         "stream_status": stream.get("stream_status"),
@@ -686,7 +722,7 @@ def wait_for_active_stream(runtime: StreamRuntime) -> dict[str, Any]:
         wait_with_runtime(runtime, poll_interval())
 
 
-def reconcile_command_args() -> list[str]:
+def reconcile_command_args(*, offline_create: bool = False) -> list[str]:
     args = [
         "reconcile-broadcast",
         "--allow-create",
@@ -698,6 +734,8 @@ def reconcile_command_args() -> list[str]:
     title = os.environ.get("YTA_YOUTUBE_TITLE")
     if title:
         args.extend(["--title", title])
+    if offline_create:
+        args.append("--offline-create")
     return args
 
 
@@ -789,9 +827,17 @@ def publish_when_healthy(runtime: StreamRuntime, initial_state: dict[str, Any]) 
     raise EncoderStopped("YouTube stream did not remain healthy long enough for publication")
 
 
-def manage_youtube_lifecycle(runtime: StreamRuntime) -> dict[str, Any]:
+def manage_youtube_lifecycle(
+    runtime: StreamRuntime,
+    prepared_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     active_stream = wait_for_active_stream(runtime)
-    state = api_command_while_streaming(reconcile_command_args(), runtime, timeout=120)
+    if prepared_state is None:
+        state = api_command_while_streaming(reconcile_command_args(), runtime, timeout=120)
+    else:
+        state = dict(prepared_state)
+        if verified_public_state(state):
+            state = revalidate_public_state(runtime, state)
     stream_id = str(state.get("stream_id") or state.get("last_stream_id") or "")
     broadcast_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
     if not stream_id or not broadcast_id:
@@ -820,11 +866,50 @@ def verified_public_state(state: dict[str, Any]) -> bool:
     return lifecycle == "live" and privacy == "public" and bool(stream_id and broadcast_id)
 
 
+def disable_public_fallback(error: ApiCommandError) -> ApiCommandError:
+    payload = dict(error.payload)
+    payload["public_fallback_allowed"] = False
+    return ApiCommandError(
+        returncode=error.returncode,
+        operation=error.operation,
+        payload=payload,
+    )
+
+
+def reconcile_invalid_public_state(runtime: StreamRuntime) -> dict[str, Any]:
+    try:
+        return api_command_while_streaming(reconcile_command_args(), runtime, timeout=120)
+    except ApiCommandError as error:
+        raise disable_public_fallback(error) from error
+
+
+def revalidate_public_state(runtime: StreamRuntime, state: dict[str, Any]) -> dict[str, Any]:
+    try:
+        observation = current_observation(runtime, state)
+    except ApiCommandError as error:
+        if error.public_fallback_allowed:
+            raise
+        log("cached public broadcast is no longer recoverable; reconciling replacement")
+        return reconcile_invalid_public_state(runtime)
+
+    if observation.get("lifecycle") == "live" and observation.get("privacy") == "public":
+        refreshed = dict(state)
+        refreshed["lifecycle"] = "live"
+        refreshed["privacy"] = "public"
+        return refreshed
+
+    log(
+        "cached public broadcast is no longer live/public; reconciling replacement "
+        f"lifecycle={observation.get('lifecycle')} privacy={observation.get('privacy')}"
+    )
+    return reconcile_invalid_public_state(runtime)
+
+
 def manage_with_public_fallback(runtime: StreamRuntime, cached_state: dict[str, Any]) -> dict[str, Any]:
     try:
-        return manage_youtube_lifecycle(runtime)
+        return manage_youtube_lifecycle(runtime, prepared_state=cached_state)
     except ApiCommandError as error:
-        if not verified_public_state(cached_state):
+        if not verified_public_state(cached_state) or not error.public_fallback_allowed:
             raise
         ensure_encoder_running(runtime)
         retry_class = classify_api_error(error)
@@ -912,6 +997,12 @@ def read_recovery_state() -> dict[str, Any]:
     return api_command(["state"], timeout=30)
 
 
+def prepare_youtube_lifecycle(cached_state: dict[str, Any]) -> dict[str, Any]:
+    if not lifecycle_enabled():
+        return dict(cached_state)
+    return api_command(reconcile_command_args(offline_create=True), timeout=120)
+
+
 def supervise_stream(runtime: StreamRuntime, *, started_at: float, max_runtime: float) -> int:
     while not stopping:
         drain_ffmpeg_output(runtime, timeout=1.0)
@@ -939,6 +1030,8 @@ def run_once(cached_state: dict[str, Any] | None = None) -> int:
     if not source_available(input_url):
         raise SourceUnavailable("camera source probe failed")
 
+    prepared_state = prepare_youtube_lifecycle(cached_state or {})
+
     log(f"starting ffmpeg mode={env('YTA_MODE', 'copy')}")
     started = time.monotonic()
     child = subprocess.Popen(
@@ -963,7 +1056,7 @@ def run_once(cached_state: dict[str, Any] | None = None) -> int:
         if bool_env("YTA_YOUTUBE_COMPLETE_ON_EXIT", False):
             log("YTA_YOUTUBE_COMPLETE_ON_EXIT is deprecated and ignored; use the explicit complete command")
         if lifecycle_enabled():
-            manage_with_public_fallback(runtime, cached_state or {})
+            manage_with_public_fallback(runtime, prepared_state)
         return supervise_stream(runtime, started_at=started, max_runtime=max_runtime)
     finally:
         if child and child.poll() is None:

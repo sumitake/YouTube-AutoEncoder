@@ -12,7 +12,7 @@ The project runs FFmpeg under systemd, optionally reuses OBS profile data for ca
 
 YouTube AutoEncoder turns a dedicated Linux device into an unattended YouTube streaming encoder. The core service performs three jobs:
 
-- Validate the camera and FFmpeg media path before creating or transitioning a YouTube broadcast.
+- Validate the camera source, stage one marked unlisted broadcast, and require healthy media before lifecycle transitions.
 - Push the stream with FFmpeg using low-CPU video copy mode or explicit transcode mode.
 - Reconcile one marked YouTube broadcast, stage it unlisted, and publish it only after live health is confirmed.
 
@@ -78,18 +78,18 @@ OBS compatibility mode can also read and update:
 2. The supervisor acquires its single-instance lock and honors any persisted recovery deadline.
 3. The source and ingest URLs are resolved from direct settings or OBS compatibility files.
 4. FFprobe checks the RTSP source; unavailable sources use bounded source backoff without a broadcast insert.
-5. FFmpeg starts, emits machine-readable progress, and pushes to the reusable YouTube stream.
-6. One-shot API checks wait for both recent media progress and active YouTube ingest.
-7. The helper reconciles local state with exact instance and generation markers, then reuses one nonterminal broadcast or creates one unlisted event when no recoverable event exists.
-8. Before and after each `testing` or `live` transition, the supervisor rechecks FFmpeg progress and YouTube ingest.
-9. Two consecutive healthy `live` observations are required before visibility changes to `YTA_YOUTUBE_LIVE_PRIVACY`.
-10. The helper verifies the privacy readback, clears recovery state, and the supervisor stops nonessential API polling.
-11. FFmpeg remains supervised until source loss, process failure, service stop, rotation, or host interruption.
-12. Failures persist a class-specific cooldown and restart the same broadcast without completing it.
+5. Before ingest starts, the helper lists recoverable events, blocks any unmarked event bound to the reusable stream, and reuses or stages exactly one marked unlisted broadcast.
+6. The helper durably stores the broadcast ID and verifies binding before the supervisor starts FFmpeg.
+7. FFmpeg emits machine-readable progress and pushes to the reusable YouTube stream.
+8. One-shot API checks wait for both recent media progress and active YouTube ingest.
+9. Before and after each `testing` or `live` transition, the supervisor rechecks FFmpeg progress and YouTube ingest.
+10. Two consecutive healthy `live` observations are required before visibility changes to `YTA_YOUTUBE_LIVE_PRIVACY`.
+11. The helper verifies the privacy readback, clears recovery state, and the supervisor stops nonessential API polling.
+12. FFmpeg remains supervised until source loss, process failure, service stop, rotation, or host interruption; failures persist a class-specific cooldown and reuse the same broadcast without completing it.
 
 ### Recovery Behavior
 
-Every recovery path first preserves ownership and retry state. Media must be fresh and YouTube ingest active before reconciliation can create or transition anything.
+Every recovery path first preserves ownership and retry state. After a passing source probe, the YouTube control plane must reconcile ownership and binding before FFmpeg starts, including for cached public state. Fresh media and active YouTube ingest remain mandatory before `testing`, `live`, or public promotion.
 
 See the [recovery state machine](docs/architecture-and-flows.md#recovery-state-machine) for startup, managed-generation, and durable-cooldown transitions.
 
@@ -99,11 +99,13 @@ See the [recovery state machine](docs/architecture-and-flows.md#recovery-state-m
 | Camera loses power during stream | FFmpeg exits; the same broadcast and watch URL remain; source backoff continues until the camera returns. |
 | Host reboots | systemd restarts the service, the durable cache is reconciled, and the same nonterminal event resumes. |
 | FFmpeg exits or stalls | The child and any in-flight API helper stop; the same event is retained for retry. |
-| YouTube ingest does not become active | No insert or transition occurs; the attempt uses source/encoder backoff. |
-| YouTube API rate limit or outage | The retry class and deadline persist. A previously verified public stream can continue without control-plane mutation. |
+| YouTube ingest does not become active | The single staged unlisted event is retained; no transition or publication occurs. |
+| YouTube API rate limit or outage before FFmpeg starts | Startup fails closed, no ingest begins, and the retry class and deadline persist. |
+| YouTube API rate limit or outage after validated public ingest is active | The already-running public stream can continue without control-plane mutation. |
+| Unmarked event is bound to the reusable stream | Reconciliation fails closed before FFmpeg starts, preventing an unintended legacy auto-start. |
 | Ambiguous or unknown remote state | Reconciliation fails closed and creates nothing until the ambiguity is resolved. |
 | OAuth access token expires | API helper refreshes from the stored refresh token. |
-| Previous broadcast is `complete`, `revoked`, or confirmed missing | One new generation may be created after ingest is active. |
+| Previous broadcast is `complete`, `revoked`, or confirmed missing | One new unlisted generation may be staged after the source probe passes. |
 
 Recovery deadlines survive service and host restarts. Exponential backoff uses these class floors and caps:
 
@@ -408,6 +410,7 @@ youtube-autoencoder-api complete
 - YouTube Live must already be enabled on the channel. New or restricted channels may not be allowed to stream immediately.
 - The YouTube Data API flow requires OAuth user consent. A simple API key is not enough for creating, binding, or transitioning live broadcasts.
 - Google OAuth app restrictions can block authorization if the app is limited to an organization that does not include the streaming account.
+- A source that passes its probe and then fails can leave one marked unlisted upcoming event. Recovery reuses that event; it does not create another generation.
 - YouTube API quota, API outages, or account policy restrictions can prevent lifecycle operations even when FFmpeg is healthy.
 - Recovery reuses one exactly marked nonterminal broadcast. A new generation is permitted only after the previous managed event is `complete`, `revoked`, or confirmed missing.
 - Broadcasts created by older releases do not contain ownership markers. They are not adopted or deleted automatically; inventory and clean up legacy duplicates separately after verifying their lifecycle and watch URLs.
@@ -425,9 +428,9 @@ youtube-autoencoder-api complete
 
 Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full history.
 
-### 2026-07-10 - Idempotent YouTube Lifecycle Recovery
+### 2026-07-11 - Pre-Ingest Broadcast Staging
 
-- Added exact broadcast reconciliation, FFmpeg progress supervision, persisted backoff, explicit-only completion, and verified unlisted-to-public promotion while preserving one watch URL across failures.
+- Reconciles every startup before FFmpeg ingest, stages and binds one marked unlisted event when needed, blocks unmarked bound conflicts, revalidates cached public events after ingest, and logs structured API operation and rate-limit details without exposing credentials.
 
 ## Repository Layout
 

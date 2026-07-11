@@ -86,6 +86,10 @@ class ReconciliationError(RuntimeError):
     retry_class = "ambiguous"
 
 
+class RemoteBroadcastStateError(ReconciliationError):
+    public_fallback_allowed = False
+
+
 def log(message: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {message}", file=sys.stderr, flush=True)
 
@@ -185,7 +189,7 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
             "retry_class": exc.retry_class,
         }
     retry_class = str(getattr(exc, "retry_class", "fatal"))
-    return {
+    payload = {
         "error": True,
         "http_status": None,
         "message": str(exc),
@@ -193,6 +197,9 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
         "retry_after": None,
         "retry_class": retry_class,
     }
+    if getattr(exc, "public_fallback_allowed", True) is False:
+        payload["public_fallback_allowed"] = False
+    return payload
 
 
 def client_config() -> dict[str, str]:
@@ -500,15 +507,33 @@ def list_broadcasts(status: str) -> list[dict[str, Any]]:
             return items
 
 
-def list_managed_broadcasts(instance: str) -> list[dict[str, Any]]:
-    marker = instance_marker(instance)
-    matches: dict[str, dict[str, Any]] = {}
+def list_recoverable_broadcasts() -> list[dict[str, Any]]:
+    broadcasts: dict[str, dict[str, Any]] = {}
     for status in ("active", "upcoming"):
         for broadcast in list_broadcasts(status):
             broadcast_id = str(broadcast.get("id") or "")
-            if broadcast_id and has_marker(broadcast, marker):
-                matches[broadcast_id] = broadcast
-    return list(matches.values())
+            if broadcast_id:
+                broadcasts[broadcast_id] = broadcast
+    return list(broadcasts.values())
+
+
+def list_managed_broadcasts(instance: str) -> list[dict[str, Any]]:
+    marker = instance_marker(instance)
+    return [broadcast for broadcast in list_recoverable_broadcasts() if has_marker(broadcast, marker)]
+
+
+def list_offline_managed_broadcasts(instance: str, stream_id: str) -> list[dict[str, Any]]:
+    marker = instance_marker(instance)
+    broadcasts = list_recoverable_broadcasts()
+    conflicts = [
+        broadcast
+        for broadcast in broadcasts
+        if broadcast_bound_stream(broadcast) == stream_id and not has_marker(broadcast, marker)
+    ]
+    if conflicts:
+        ids = ",".join(sorted(str(item.get("id") or "") for item in conflicts))
+        raise ReconciliationError(f"unmarked broadcast is bound to the reusable stream: {ids}")
+    return [broadcast for broadcast in broadcasts if has_marker(broadcast, marker)]
 
 
 def utc_now() -> str:
@@ -592,8 +617,17 @@ def choose_candidate(
     return candidate
 
 
-def reconcile_broadcast(*, stream_id: str, title: str, staging_privacy: str, allow_create: bool) -> dict[str, Any]:
+def reconcile_broadcast(
+    *,
+    stream_id: str,
+    title: str,
+    staging_privacy: str,
+    allow_create: bool,
+    offline_create: bool = False,
+) -> dict[str, Any]:
     with mutation_lock(timeout=lock_timeout()):
+        if offline_create and staging_privacy != "unlisted":
+            raise ReconciliationError("offline broadcast staging must use unlisted privacy")
         instance = instance_id()
         state = read_state()
         if (
@@ -605,6 +639,7 @@ def reconcile_broadcast(*, stream_id: str, title: str, staging_privacy: str, all
 
         generation = str(state.get("generation_id") or "") or None
         broadcast: dict[str, Any] | None = None
+        offline_candidates = list_offline_managed_broadcasts(instance, stream_id) if offline_create else None
         cached_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
         if cached_id:
             cached = broadcast_by_id(cached_id)
@@ -616,8 +651,18 @@ def reconcile_broadcast(*, stream_id: str, title: str, staging_privacy: str, all
                     state = {}
                     generation = None
 
+        def candidates() -> list[dict[str, Any]]:
+            nonlocal offline_candidates
+            if offline_create:
+                if offline_candidates is not None:
+                    result = offline_candidates
+                    offline_candidates = None
+                    return result
+                return list_offline_managed_broadcasts(instance, stream_id)
+            return list_managed_broadcasts(instance)
+
         if broadcast is None:
-            managed = list_managed_broadcasts(instance)
+            managed = candidates()
             broadcast = choose_candidate(
                 managed,
                 instance=instance,
@@ -629,12 +674,14 @@ def reconcile_broadcast(*, stream_id: str, title: str, staging_privacy: str, all
             raise ReconciliationError("no recoverable managed broadcast exists and creation is disabled")
 
         if broadcast is None:
-            stream = stream_by_id(stream_id)
-            stream_status_value = str((stream.get("status") or {}).get("streamStatus") or "")
-            if stream_status_value != "active":
-                raise ReconciliationError(
-                    f"YouTube ingest must be active before broadcast creation; got {stream_status_value or 'unknown'}"
-                )
+            if not offline_create:
+                stream = stream_by_id(stream_id)
+                stream_status_value = str((stream.get("status") or {}).get("streamStatus") or "")
+                if stream_status_value != "active":
+                    raise ReconciliationError(
+                        "YouTube ingest must be active before broadcast creation; "
+                        f"got {stream_status_value or 'unknown'}"
+                    )
             if generation is None:
                 generation = str(uuid.uuid4())
                 state = lifecycle_state(
@@ -650,7 +697,7 @@ def reconcile_broadcast(*, stream_id: str, title: str, staging_privacy: str, all
                 write_state(state)
 
             exact = choose_candidate(
-                list_managed_broadcasts(instance),
+                candidates(),
                 instance=instance,
                 generation=generation,
                 stream_id=stream_id,
@@ -658,12 +705,14 @@ def reconcile_broadcast(*, stream_id: str, title: str, staging_privacy: str, all
             if exact is not None:
                 broadcast = exact
             else:
-                stream = stream_by_id(stream_id)
-                stream_status_value = str((stream.get("status") or {}).get("streamStatus") or "")
-                if stream_status_value != "active":
-                    raise ReconciliationError(
-                        f"YouTube ingest stopped before broadcast creation; got {stream_status_value or 'unknown'}"
-                    )
+                if not offline_create:
+                    stream = stream_by_id(stream_id)
+                    stream_status_value = str((stream.get("status") or {}).get("streamStatus") or "")
+                    if stream_status_value != "active":
+                        raise ReconciliationError(
+                            "YouTube ingest stopped before broadcast creation; "
+                            f"got {stream_status_value or 'unknown'}"
+                        )
                 broadcast = create_broadcast(
                     title,
                     staging_privacy,
@@ -803,7 +852,7 @@ def broadcast_status_payload(broadcast: dict[str, Any]) -> dict[str, Any]:
 def broadcast_status(broadcast_id: str) -> dict[str, Any]:
     broadcast = broadcast_by_id(broadcast_id)
     if broadcast is None:
-        raise ReconciliationError(f"liveBroadcast not found: {broadcast_id}")
+        raise RemoteBroadcastStateError(f"liveBroadcast not found: {broadcast_id}")
     return broadcast_status_payload(broadcast)
 
 
@@ -928,6 +977,7 @@ def reconcile_command(args: argparse.Namespace) -> int:
         title=title,
         staging_privacy=args.privacy,
         allow_create=args.allow_create,
+        offline_create=bool(getattr(args, "offline_create", False)),
     )
     print(json.dumps(state, indent=2, sort_keys=True))
     return 0
@@ -1138,7 +1188,12 @@ def main() -> int:
     reconcile_p.add_argument(
         "--allow-create",
         action="store_true",
-        help="Permit one new broadcast only after ingest is active and reconciliation is unambiguous",
+        help="Permit one new broadcast after the selected reconciliation safety gate passes",
+    )
+    reconcile_p.add_argument(
+        "--offline-create",
+        action="store_true",
+        help="Explicitly stage and bind one marked unlisted broadcast before ingest starts",
     )
     reconcile_p.set_defaults(func=reconcile_command)
 

@@ -92,12 +92,14 @@ Keep SSH, Raspberry Pi Connect, a remote tunnel, or another remote-management pa
 ## Recovery Model
 
 - Camera offline: source probe fails, no new broadcast is created, and source backoff is persisted.
-- Camera returns: FFmpeg establishes active ingest before the helper reconciles or creates an unlisted event.
+- Camera returns: after the source probe passes, the helper stages and binds one marked unlisted event before FFmpeg starts ingest.
 - Pre-live failure: the same unlisted broadcast ID remains available for the next attempt.
 - Confirmed live health: two consecutive healthy observations promote the event to configured live visibility.
 - FFmpeg or camera failure after live: the event and watch URL remain; the service resumes ingest without completing it.
 - Pi reboot: systemd starts the service, honors persisted cooldowns, and reconciles the same nonterminal event.
-- API quota or outage: lifecycle mutations pause under a persisted cooldown; a verified public stream can continue without nonessential API polling.
+- API quota or outage before FFmpeg starts: startup fails closed and waits under a persisted cooldown rather than trusting cached public state.
+- API quota or outage after validated public ingest is active: the already-running stream can continue without nonessential API polling.
+- Unmarked bound event: the helper blocks before FFmpeg starts so legacy auto-start settings cannot expose an unmanaged event.
 - Ambiguous remote state: the helper creates nothing until an operator resolves the ambiguity.
 
 ## Test Pattern
