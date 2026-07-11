@@ -18,6 +18,11 @@ sudo install -m 0755 bin/youtube-autoencoder /usr/local/bin/youtube-autoencoder
 sudo install -m 0755 bin/youtube-autoencoder-api /usr/local/bin/youtube-autoencoder-api
 sudo install -m 0755 bin/youtube-autoencoder-test-pattern /usr/local/bin/youtube-autoencoder-test-pattern
 sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-autoencoder-telemetry
+```
+
+For the recommended system-mode deployment on a dedicated Pi, install the system units:
+
+```bash
 sudo install -m 0644 systemd/youtube-autoencoder@.service /etc/systemd/system/youtube-autoencoder@.service
 sudo install -m 0644 systemd/youtube-autoencoder-telemetry@.service /etc/systemd/system/youtube-autoencoder-telemetry@.service
 sudo install -m 0644 systemd/youtube-autoencoder-telemetry@.timer /etc/systemd/system/youtube-autoencoder-telemetry@.timer
