@@ -28,27 +28,54 @@ The intended outcome is an appliance-like encoder that can be deployed on a Rasp
 
 ## Architecture
 
-```text
-camera -> FFprobe -> FFmpeg -> reusable YouTube ingest
-                         |                 |
-                         | progress        | stream health
-                         v                 v
-                 youtube-autoencoder supervisor
-                         |
-                         | bounded JSON commands
-                         v
-                 youtube-autoencoder-api
-                         |
-          OAuth, reconciliation, transitions, privacy
-                         |
-                         v
-                  YouTube Data API v3
-                         |
-                         v
-            one marked YouTube Live broadcast
+```mermaid
+flowchart TB
+    subgraph ArchitectureInputs["Source and compatibility inputs"]
+        direction LR
+        Camera["RTSP camera"]
+        ObsScene["Optional OBS scene"]
+        ObsService["Optional OBS service profile"]
+    end
+
+    subgraph ArchitectureHost["Encoder host"]
+        direction TB
+        Systemd["systemd service"]
+        Supervisor["youtube-autoencoder supervisor"]
+        Probe["FFprobe source validation"]
+        Encoder["FFmpeg media pipeline"]
+        Helper["youtube-autoencoder-api"]
+        State["Durable state and locks"]
+        OAuth["OAuth client and token"]
+    end
+
+    subgraph ArchitectureYouTube["YouTube"]
+        direction LR
+        Ingest["Reusable liveStream ingest"]
+        Api["YouTube Data API v3"]
+        Broadcast["One marked liveBroadcast and watch page"]
+    end
+
+    Systemd -->|"start and restart"| Supervisor
+    ObsScene -->|"source discovery"| Supervisor
+    ObsService -->|"ingest compatibility"| Supervisor
+    Supervisor -->|"probe"| Probe
+    Camera -->|"RTSP media"| Probe
+    Probe -->|"source health"| Supervisor
+    Supervisor -->|"spawn and supervise"| Encoder
+    Camera -->|"video"| Encoder
+    Encoder -->|"progress"| Supervisor
+    Encoder -->|"RTMPS media"| Ingest
+    Supervisor -->|"bounded JSON commands"| Helper
+    Helper <-->|"read and write"| State
+    OAuth -->|"authorization"| Helper
+    Helper <-->|"lifecycle and health"| Api
+    Ingest -->|"stream health"| Api
+    Api <-->|"create, bind, transition, verify"| Broadcast
 ```
 
 The supervisor owns local process health, polling, backoff, and publication timing. The API helper owns OAuth, remote resource reconciliation, durable lifecycle state, and serialized mutations. YouTube remains authoritative; the local state file is a recovery cache and is revalidated before mutations.
+
+For the detailed reconciliation algorithm, lifecycle states, and test strategy, see the [idempotent lifecycle recovery design](docs/superpowers/specs/2026-07-10-idempotent-youtube-lifecycle-design.md).
 
 ### Components
 
@@ -105,6 +132,41 @@ OBS compatibility mode can also read and update:
 
 ### Recovery Behavior
 
+Every recovery path first preserves ownership and retry state. Media must be fresh and YouTube ingest active before reconciliation can create or transition anything.
+
+```mermaid
+stateDiagram-v2
+    state "Startup or restart" as RecoveryStartup
+    state "Managed stream generation" as RecoveryGeneration {
+        state "Probe source and start FFmpeg" as RecoveryMedia
+        state "Require fresh active ingest" as RecoveryIngest
+        state "Reconcile exact ownership markers" as RecoveryReconcile
+        state "Create and bind unlisted generation" as RecoveryCreate
+        state "Resume one nonterminal event" as RecoveryManaged
+        state "Testing, live, and publication gates" as RecoveryGates
+        state "Verified public stream" as RecoveryStable
+        state "Public stream with API cooldown" as RecoveryPublicFallback
+
+        [*] --> RecoveryMedia
+        RecoveryMedia --> RecoveryIngest : media progress fresh
+        RecoveryIngest --> RecoveryReconcile : YouTube ingest active
+        RecoveryReconcile --> RecoveryManaged : one marked nonterminal event
+        RecoveryReconcile --> RecoveryCreate : none, terminal, or missing
+        RecoveryCreate --> RecoveryManaged : insert and bind verified
+        RecoveryManaged --> RecoveryGates
+        RecoveryGates --> RecoveryStable : two healthy live observations and privacy readback
+        RecoveryStable --> RecoveryPublicFallback : API unavailable, media healthy
+        RecoveryPublicFallback --> RecoveryStable : API recovers
+    }
+    state "Persist classified cooldown" as RecoveryBackoff
+
+    [*] --> RecoveryStartup
+    RecoveryStartup --> RecoveryBackoff : retry deadline active
+    RecoveryBackoff --> RecoveryStartup : deadline expires or host restarts
+    RecoveryStartup --> RecoveryGeneration : no active deadline
+    RecoveryGeneration --> RecoveryBackoff : recoverable failure, preserve ownership
+```
+
 | Failure | Expected behavior |
 | --- | --- |
 | Camera offline before stream start | Source probe fails; no new broadcast is created; source backoff is persisted. |
@@ -136,6 +198,48 @@ This verifies the YouTube account, OAuth token, reusable stream, ingest URL, bro
 
 ## Installation
 
+Provision the YouTube control plane and the encoder host in this order. The detailed console steps and commands remain in the sections that follow.
+
+```mermaid
+flowchart TD
+    DeploymentChannel["Enable YouTube Live on the target channel"]
+    DeploymentProject["Enable YouTube Data API v3"]
+    DeploymentAudience["Configure a compatible OAuth audience"]
+    DeploymentClient["Create a TV or Limited Input OAuth client"]
+    DeploymentRuntime["Install FFmpeg, Python, and project scripts"]
+    DeploymentConfig["Create private encoder, OAuth, and writable service files"]
+    DeploymentAuthorize["Authorize the channel account"]
+    DeploymentCamera["Configure camera source and ingest profile"]
+    DeploymentStreamDecision{"Reusable stream already configured?"}
+    DeploymentProvision["Run visible test with --create-stream"]
+    DeploymentValidate["Run unlisted visible validation"]
+    DeploymentValidationDecision{"Validation succeeds?"}
+    DeploymentDiagnose["Fix OAuth, source, ingest, or quota issue"]
+    DeploymentEnable["Enable the systemd service"]
+    DeploymentReboot["Reboot the encoder host"]
+    DeploymentVerify["Verify encoder and remote-management recovery"]
+    DeploymentOperate["Unattended operation"]
+
+    DeploymentChannel --> DeploymentProject
+    DeploymentProject --> DeploymentAudience
+    DeploymentAudience --> DeploymentClient
+    DeploymentClient --> DeploymentRuntime
+    DeploymentRuntime --> DeploymentConfig
+    DeploymentConfig --> DeploymentAuthorize
+    DeploymentAuthorize --> DeploymentCamera
+    DeploymentCamera --> DeploymentStreamDecision
+    DeploymentStreamDecision -->|"No"| DeploymentProvision
+    DeploymentProvision --> DeploymentValidate
+    DeploymentStreamDecision -->|"Yes"| DeploymentValidate
+    DeploymentValidate --> DeploymentValidationDecision
+    DeploymentValidationDecision -->|"No"| DeploymentDiagnose
+    DeploymentDiagnose --> DeploymentStreamDecision
+    DeploymentValidationDecision -->|"Yes"| DeploymentEnable
+    DeploymentEnable --> DeploymentReboot
+    DeploymentReboot --> DeploymentVerify
+    DeploymentVerify --> DeploymentOperate
+```
+
 Install runtime packages:
 
 ```bash
@@ -164,7 +268,6 @@ Install the system service for a dedicated user named `encoder`:
 ```bash
 sudo install -m 0644 systemd/youtube-autoencoder@.service /etc/systemd/system/youtube-autoencoder@.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now youtube-autoencoder@encoder.service
 ```
 
 For a user service instead:
@@ -173,8 +276,9 @@ For a user service instead:
 mkdir -p ~/.config/systemd/user
 cp systemd/user/youtube-autoencoder.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now youtube-autoencoder.service
 ```
+
+The unit is installed but deliberately left disabled until OAuth, source, ingest, and visible-stream validation succeed.
 
 For Raspberry Pi specific notes, see `docs/raspberry-pi.md`.
 
@@ -214,7 +318,17 @@ YTA_OBS_SCENE_FILE=/home/encoder/.config/obs-studio/basic/scenes/Untitled.json
 YTA_OBS_SOURCE_NAME=Camera RTSP
 ```
 
-The OBS service file supplies the reusable YouTube RTMPS server and stream key. A fresh reusable stream can be provisioned by running the visible test with `--create-stream`; the helper then updates this file before starting the test encoder.
+The OBS service file supplies the reusable YouTube RTMPS server and stream key. It must exist, be writable by the service user, and contain a non-empty `settings.key` before `--create-stream` runs. For a fresh deployment, keep the service disabled and seed a placeholder key:
+
+```json
+{
+  "settings": {
+    "key": "provision-new-stream"
+  }
+}
+```
+
+The placeholder is not a YouTube stream key. `--create-stream` uses it to confirm that no existing stream matches, then replaces it with the new reusable stream key and writes the ingest server before starting the test encoder. A missing file or empty key does not enter the creation path.
 
 ## YouTube API and OAuth Provisioning
 
@@ -327,7 +441,7 @@ If you already have an OBS-compatible `service.json` with a YouTube stream key:
 youtube-autoencoder-api status
 ```
 
-For a fresh setup, make sure the service user can write the configured OBS service file. Then provision the reusable stream through an API-managed visible test after the rest of the encoder config is in place:
+For a fresh setup, create the writable OBS service file with the placeholder `settings.key` shown in the Configuration Model. Then provision the reusable stream through an API-managed visible test after the rest of the encoder config is in place:
 
 ```bash
 YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
@@ -335,6 +449,20 @@ YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
 ```
 
 This validates OAuth, reusable-stream provisioning, idempotent broadcast reconciliation, stream binding, ingest detection, transitions to `testing` and `live`, and explicit completion. The normal unattended service never completes on exit.
+
+### 8. Enable the Service
+
+After visible validation succeeds, enable the system service:
+
+```bash
+sudo systemctl enable --now youtube-autoencoder@encoder.service
+```
+
+For a user service instead:
+
+```bash
+systemctl --user enable --now youtube-autoencoder.service
+```
 
 ### Common Authorization Problems
 
