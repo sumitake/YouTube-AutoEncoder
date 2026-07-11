@@ -29,7 +29,7 @@ These commands install but do not enable the system telemetry timer. The user ti
 Create the dedicated account if it does not already exist, then install its private configuration:
 
 ```bash
-sudo useradd --create-home --user-group --shell /usr/sbin/nologin encoder
+id -u encoder >/dev/null 2>&1 || sudo useradd --create-home --user-group --shell /usr/sbin/nologin encoder
 sudo install -d -m 0700 -o encoder -g encoder /home/encoder/.config/youtube-autoencoder
 sudo install -m 0600 -o encoder -g encoder config/youtube-autoencoder.env.example /home/encoder/.config/youtube-autoencoder/youtube-autoencoder.env
 ```
@@ -86,7 +86,7 @@ journalctl -u youtube-autoencoder@encoder.service -f
 
 ## Optional Video Telemetry
 
-Telemetry is disabled by default and never controls encoder recovery. To opt in, set this in `/home/encoder/.config/youtube-autoencoder/youtube-autoencoder.env`:
+Telemetry is disabled by default and never controls encoder recovery. For system mode, set this in `/home/encoder/.config/youtube-autoencoder/youtube-autoencoder.env`:
 
 ```text
 YTA_TELEMETRY_ENABLED=true
@@ -98,7 +98,7 @@ Choose exactly one timer mode. For the system service user `encoder`:
 sudo systemctl enable --now youtube-autoencoder-telemetry@encoder.timer
 ```
 
-For a user-service deployment, install the user unit pair and enable its timer instead:
+For a user-service deployment, first complete the [user-service installation](../README.md#installation). Set `YTA_TELEMETRY_ENABLED=true` in `~/.config/youtube-autoencoder/youtube-autoencoder.env`, then install the user telemetry pair and enable its timer instead:
 
 ```bash
 mkdir -p ~/.config/systemd/user

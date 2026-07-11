@@ -174,7 +174,7 @@ sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-au
 For a system service, create the dedicated account if it does not already exist:
 
 ```bash
-sudo useradd --create-home --user-group --shell /usr/sbin/nologin encoder
+id -u encoder >/dev/null 2>&1 || sudo useradd --create-home --user-group --shell /usr/sbin/nologin encoder
 ```
 
 Create its private configuration and install the system units:
