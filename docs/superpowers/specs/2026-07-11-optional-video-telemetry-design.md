@@ -200,7 +200,7 @@ and explicitly enabling the appropriate timer.
 - A future `last_attempt_at`, including one caused by a backward clock correction, remains throttled rather than being treated as expired.
 - API-helper failures produce no telemetry sample, retain the write-ahead attempt timestamp, and return the helper's nonzero status.
 - Helper stderr is parsed as structured JSON. Collector logs expose only operation, retry class, HTTP status, and reason identifiers; arbitrary helper text is not echoed.
-- Malformed helper success output is a telemetry failure and produces no files beyond the lock.
+- Malformed helper success output is a telemetry failure and produces no sample files beyond the throttle ledger and lock.
 - Sample-write failure is reported after the helper call, retains the write-ahead attempt timestamp, and never mutates lifecycle state.
 - Telemetry never invokes `set-retry`, `clear-retry`, lifecycle transitions, privacy changes, or broadcast reconciliation.
 - Telemetry service or timer failure cannot restart or stop the encoder service.

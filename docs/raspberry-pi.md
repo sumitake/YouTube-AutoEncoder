@@ -17,9 +17,14 @@ From a checkout of this repository:
 sudo install -m 0755 bin/youtube-autoencoder /usr/local/bin/youtube-autoencoder
 sudo install -m 0755 bin/youtube-autoencoder-api /usr/local/bin/youtube-autoencoder-api
 sudo install -m 0755 bin/youtube-autoencoder-test-pattern /usr/local/bin/youtube-autoencoder-test-pattern
+sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-autoencoder-telemetry
 sudo install -m 0644 systemd/youtube-autoencoder@.service /etc/systemd/system/youtube-autoencoder@.service
+sudo install -m 0644 systemd/youtube-autoencoder-telemetry@.service /etc/systemd/system/youtube-autoencoder-telemetry@.service
+sudo install -m 0644 systemd/youtube-autoencoder-telemetry@.timer /etc/systemd/system/youtube-autoencoder-telemetry@.timer
 sudo systemctl daemon-reload
 ```
+
+These commands install but do not enable the system telemetry timer. The user timer also remains disabled unless it is separately installed and enabled.
 
 Create the service configuration:
 
@@ -78,6 +83,52 @@ Watch logs:
 ```bash
 journalctl -u youtube-autoencoder@encoder.service -f
 ```
+
+## Optional Video Telemetry
+
+Telemetry is disabled by default and never controls encoder recovery. To opt in, set this in the service user's private environment file:
+
+```text
+YTA_TELEMETRY_ENABLED=true
+```
+
+Choose exactly one timer mode. For the system service user `encoder`:
+
+```bash
+sudo systemctl enable --now youtube-autoencoder-telemetry@encoder.timer
+```
+
+For a user-service deployment, install the user unit pair and enable its timer instead:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/user/youtube-autoencoder-telemetry.service ~/.config/systemd/user/
+cp systemd/user/youtube-autoencoder-telemetry.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now youtube-autoencoder-telemetry.timer
+```
+
+Inspect the selected timer and local samples:
+
+```bash
+sudo systemctl status youtube-autoencoder-telemetry@encoder.timer
+python3 -m json.tool ~/.local/state/youtube-autoencoder/telemetry/latest.json
+tail ~/.local/state/youtube-autoencoder/telemetry/"$(date -u +%F)".jsonl
+```
+
+For user mode, inspect `systemctl --user status youtube-autoencoder-telemetry.timer`. For system mode, disable the timer before setting the flag back to `false`:
+
+```bash
+sudo systemctl disable --now youtube-autoencoder-telemetry@encoder.timer
+```
+
+For user mode:
+
+```bash
+systemctl --user disable --now youtube-autoencoder-telemetry.timer
+```
+
+At the five-minute minimum interval, one active timer uses at most 288 `videos.list` quota units per 24 hours. It adds no separately priced service or external storage. Current-viewer and other optional YouTube values may be `null` when the API omits them.
 
 ## Headless Mode
 

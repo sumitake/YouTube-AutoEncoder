@@ -26,6 +26,9 @@ flowchart TB
         Helper["youtube-autoencoder-api"]
         State["Durable state and locks"]
         OAuth["OAuth client and token"]
+        TelemetryTimer["Optional telemetry timer"]
+        TelemetryCollector["youtube-autoencoder-telemetry"]
+        TelemetryFiles["Private local telemetry files"]
     end
 
     subgraph ArchitectureYouTube["YouTube"]
@@ -51,7 +54,14 @@ flowchart TB
     Helper <-->|"lifecycle and health"| Api
     Ingest -->|"stream health"| Api
     Api <-->|"create, bind, transition, verify"| Broadcast
+    TelemetryTimer -.->|"disabled-by-default one-shot"| TelemetryCollector
+    State -.->|"live identity and cooldown"| TelemetryCollector
+    TelemetryCollector -.->|"video-metrics"| Helper
+    Helper -.->|"one read-only videos.list call"| Api
+    TelemetryCollector -.->|"throttle and validated samples"| TelemetryFiles
 ```
+
+Dashed edges are the optional telemetry path. It reads durable lifecycle state, calls the existing OAuth-aware helper only for an eligible live broadcast, and stores private local snapshots. It has no edge back to the supervisor, FFmpeg, broadcast lifecycle, privacy, or recovery state.
 
 Return to [Architecture](../README.md#architecture).
 
