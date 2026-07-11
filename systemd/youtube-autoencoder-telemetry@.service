@@ -1,0 +1,14 @@
+[Unit]
+Description=YouTube AutoEncoder telemetry (%i)
+Documentation=https://github.com/sumitake/YouTube-AutoEncoder
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+EnvironmentFile=/home/%i/.config/youtube-autoencoder/youtube-autoencoder.env
+ExecStart=/usr/local/bin/youtube-autoencoder-telemetry
+WorkingDirectory=/home/%i
+Nice=10
+IOSchedulingClass=idle

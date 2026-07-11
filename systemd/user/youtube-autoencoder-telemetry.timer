@@ -1,0 +1,13 @@
+[Unit]
+Description=Collect YouTube AutoEncoder telemetry
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Persistent=false
+Unit=youtube-autoencoder-telemetry.service
+
+[Install]
+WantedBy=timers.target

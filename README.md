@@ -41,9 +41,11 @@ For the detailed reconciliation algorithm, lifecycle states, and test strategy, 
 | Supervisor | `bin/youtube-autoencoder` | Source probing, FFmpeg capability and progress supervision, lifecycle timing, publication gates, and persisted recovery policy. |
 | API helper | `bin/youtube-autoencoder-api` | OAuth, reusable stream management, exact broadcast reconciliation, serialized mutations, privacy verification, and explicit completion. |
 | Test pattern | `bin/youtube-autoencoder-test-pattern` | FFmpeg-generated moving video and tone for end-to-end YouTube ingest testing. |
+| Telemetry collector | `bin/youtube-autoencoder-telemetry` | Optional, quota-bounded `videos.list` sampling into private local files; disabled by default and isolated from recovery. |
 | Example config | `config/youtube-autoencoder.env.example` | Service environment variables for source selection, FFmpeg mode, YouTube lifecycle, retry timing, and transcode settings. |
 | System service | `systemd/youtube-autoencoder@.service` | System-level service template for a dedicated encoder user. |
 | User service | `systemd/user/youtube-autoencoder.service` | User-level service alternative. |
+| Telemetry timers | `systemd/youtube-autoencoder-telemetry@.*`, `systemd/user/youtube-autoencoder-telemetry.*` | Alternative system or user one-shot schedules; installation does not enable either timer. |
 | Pi runbook | `docs/raspberry-pi.md` | Raspberry Pi deployment notes. |
 
 ### Persistent Local State
@@ -62,6 +64,17 @@ Important files:
 - `youtube-live-state.json`: versioned, non-secret lifecycle cache containing instance, generation, stream, broadcast, privacy, lifecycle, and retry metadata.
 - `youtube-live-state.lock`: serialized mutation lock for create, bind, transition, privacy, and explicit completion operations.
 - `supervisor.lock`: process-lifetime lock preventing two encoder supervisors from running concurrently.
+
+When optional telemetry is enabled, private collector state is stored under:
+
+```text
+~/.local/state/youtube-autoencoder/telemetry/
+```
+
+- `collector-state.json`: write-ahead throttle timestamps for attempted and successful API calls.
+- `latest.json`: the most recent validated sample.
+- `YYYY-MM-DD.jsonl`: append-only UTC daily samples retained for the configured number of days.
+- `telemetry.lock`: nonblocking collector lock preventing overlapping timer runs.
 
 OBS compatibility mode can also read and update:
 
@@ -86,6 +99,18 @@ OBS compatibility mode can also read and update:
 10. Two consecutive healthy `live` observations are required before visibility changes to `YTA_YOUTUBE_LIVE_PRIVACY`.
 11. The helper verifies the privacy readback, clears recovery state, and the supervisor stops nonessential API polling.
 12. FFmpeg remains supervised until source loss, process failure, service stop, rotation, or host interruption; failures persist a class-specific cooldown and reuse the same broadcast without completing it.
+
+### Optional Telemetry Loop
+
+Telemetry is a separate one-shot path and is disabled by default:
+
+1. Exactly one system or user timer invokes `youtube-autoencoder-telemetry` at five-minute intervals.
+2. The collector exits without creating files or calling YouTube unless telemetry is enabled and cached lifecycle state identifies a live broadcast outside lifecycle and telemetry cooldowns.
+3. Under a private nonblocking lock, the collector persists `last_attempt_at` before invoking the API helper.
+4. The helper performs one read-only `videos.list` request for aggregate live-stream and video statistics.
+5. A validated sample is written to `latest.json` and the current UTC daily JSONL file; old daily files are pruned after the configured retention period.
+
+The minimum interval is 300 seconds. With one timer mode active, a continuously eligible stream uses at most 288 `videos.list` quota units per 24 hours. The collector never starts or restarts FFmpeg, changes broadcast lifecycle or privacy, or alters encoder retry state.
 
 ### Recovery Behavior
 
@@ -143,32 +168,39 @@ Install the scripts:
 sudo install -m 0755 bin/youtube-autoencoder /usr/local/bin/youtube-autoencoder
 sudo install -m 0755 bin/youtube-autoencoder-api /usr/local/bin/youtube-autoencoder-api
 sudo install -m 0755 bin/youtube-autoencoder-test-pattern /usr/local/bin/youtube-autoencoder-test-pattern
+sudo install -m 0755 bin/youtube-autoencoder-telemetry /usr/local/bin/youtube-autoencoder-telemetry
 ```
 
-Create a config directory for the service user:
+For a system service, create the dedicated account if it does not already exist:
 
 ```bash
-mkdir -p ~/.config/youtube-autoencoder
-cp config/youtube-autoencoder.env.example ~/.config/youtube-autoencoder/youtube-autoencoder.env
-chmod 600 ~/.config/youtube-autoencoder/youtube-autoencoder.env
+id -u encoder >/dev/null 2>&1 || sudo useradd --create-home --user-group --shell /usr/sbin/nologin encoder
 ```
 
-Install the system service for a dedicated user named `encoder`:
+Create its private configuration and install the system units:
 
 ```bash
+sudo install -d -m 0700 -o encoder -g encoder /home/encoder/.config/youtube-autoencoder
+sudo install -m 0600 -o encoder -g encoder config/youtube-autoencoder.env.example /home/encoder/.config/youtube-autoencoder/youtube-autoencoder.env
 sudo install -m 0644 systemd/youtube-autoencoder@.service /etc/systemd/system/youtube-autoencoder@.service
+sudo install -m 0644 systemd/youtube-autoencoder-telemetry@.service /etc/systemd/system/youtube-autoencoder-telemetry@.service
+sudo install -m 0644 systemd/youtube-autoencoder-telemetry@.timer /etc/systemd/system/youtube-autoencoder-telemetry@.timer
 sudo systemctl daemon-reload
 ```
 
 For a user service instead:
 
 ```bash
+mkdir -p ~/.config/youtube-autoencoder
+install -m 0600 config/youtube-autoencoder.env.example ~/.config/youtube-autoencoder/youtube-autoencoder.env
 mkdir -p ~/.config/systemd/user
 cp systemd/user/youtube-autoencoder.service ~/.config/systemd/user/
+cp systemd/user/youtube-autoencoder-telemetry.service ~/.config/systemd/user/
+cp systemd/user/youtube-autoencoder-telemetry.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-The unit is installed but deliberately left disabled until OAuth, source, ingest, and visible-stream validation succeed.
+The encoder unit is installed but deliberately left disabled until OAuth, source, ingest, and visible-stream validation succeed. Installing the telemetry units does not enable or start either telemetry timer.
 
 For Raspberry Pi specific notes, see `docs/raspberry-pi.md`.
 
@@ -193,6 +225,10 @@ The service is configured entirely through environment variables. The most impor
 | `YTA_FFMPEG_PROGRESS_TIMEOUT_SEC` | Maximum time without increasing FFmpeg media output before restart. |
 | `YTA_SOURCE_PROBE` | Probe the camera before creating a broadcast. |
 | `YTA_MAX_RUNTIME` | Optional forced FFmpeg rotation interval. `0` disables rotation. |
+| `YTA_TELEMETRY_ENABLED` | Enable optional local video telemetry. Defaults to `false`. |
+| `YTA_TELEMETRY_MIN_INTERVAL_SEC` | Minimum delay between eligible API attempts; values below `300` are clamped to `300`. |
+| `YTA_TELEMETRY_RETENTION_DAYS` | Number of UTC daily JSONL files to retain. Defaults to `30`. |
+| `YTA_TELEMETRY_API` | API helper path used for the read-only `video-metrics` command. |
 
 Minimal direct source configuration:
 
@@ -287,38 +323,37 @@ If the console only offers a generic installed-app flow in your environment, use
 
 ### 5. Install the OAuth Client JSON
 
-Copy the downloaded JSON to the service user's config directory:
-
-```text
-~/.config/youtube-autoencoder/google-oauth-client.json
-```
-
-Lock down the file:
+Install the downloaded JSON for the selected service mode. For system mode:
 
 ```bash
-chmod 600 ~/.config/youtube-autoencoder/google-oauth-client.json
+sudo install -m 0600 -o encoder -g encoder google-oauth-client.json /home/encoder/.config/youtube-autoencoder/google-oauth-client.json
+```
+
+For user mode:
+
+```bash
+install -m 0600 google-oauth-client.json ~/.config/youtube-autoencoder/google-oauth-client.json
 ```
 
 The file contains OAuth client credentials. Do not commit it, paste it into issue trackers, or store it in a world-readable location.
 
 ### 6. Authorize the Encoder
 
+For system mode, run the helper as the service account:
+
 ```bash
-youtube-autoencoder-api authorize
+sudo -u encoder -H youtube-autoencoder-api authorize
 ```
+
+For user mode, run `youtube-autoencoder-api authorize` directly.
 
 The command prints a verification URL and user code. Open the URL on any browser-capable device, enter the code, and approve access with the Google account that owns or manages the target YouTube channel.
 
-After approval, the helper stores the OAuth token cache at:
+After approval, the helper stores a mode-`0600` OAuth token cache under the selected service account:
 
 ```text
-~/.config/youtube-autoencoder/youtube-token.json
-```
-
-Lock down the token file:
-
-```bash
-chmod 600 ~/.config/youtube-autoencoder/youtube-token.json
+/home/encoder/.config/youtube-autoencoder/youtube-token.json  # system mode
+~/.config/youtube-autoencoder/youtube-token.json              # user mode
 ```
 
 Keep this file private. It contains the refresh token used for unattended operation.
@@ -327,16 +362,16 @@ Keep this file private. It contains the refresh token used for unattended operat
 
 If you already have an OBS-compatible `service.json` with a YouTube stream key:
 
-```bash
-youtube-autoencoder-api status
-```
+For system mode, run `sudo -u encoder -H youtube-autoencoder-api status`. For user mode, run `youtube-autoencoder-api status`.
 
 For a fresh setup, create the writable OBS service file with the placeholder `settings.key` shown in the Configuration Model. Then provision the reusable stream through an API-managed visible test after the rest of the encoder config is in place:
 
 ```bash
-YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
+sudo -u encoder -H env YTA_INSTANCE_ID=encoder-hostname youtube-autoencoder-api run-visible-test \
   --duration 900 --privacy unlisted --create-stream --complete
 ```
+
+For user mode, omit `sudo -u encoder -H env` and place `YTA_INSTANCE_ID=encoder-hostname` before the helper command.
 
 This validates OAuth, reusable-stream provisioning, idempotent broadcast reconciliation, stream binding, ingest detection, transitions to `testing` and `live`, and explicit completion. The normal unattended service never completes on exit.
 
@@ -405,6 +440,58 @@ Complete the last known broadcast manually:
 youtube-autoencoder-api complete
 ```
 
+### Optional Video Telemetry
+
+Telemetry is opt-in. First set this in the same private environment file used by the selected service mode:
+
+```text
+YTA_TELEMETRY_ENABLED=true
+```
+
+Then enable exactly one timer mode. For the system service user `encoder`:
+
+```bash
+sudo systemctl enable --now youtube-autoencoder-telemetry@encoder.timer
+```
+
+For a user service instead:
+
+```bash
+systemctl --user enable --now youtube-autoencoder-telemetry.timer
+```
+
+Do not enable both timers. For system mode, inspect timer execution and the service account's private samples with:
+
+```bash
+sudo systemctl status youtube-autoencoder-telemetry@encoder.timer
+sudo journalctl -u youtube-autoencoder-telemetry@encoder.service
+sudo -u encoder python3 -m json.tool /home/encoder/.local/state/youtube-autoencoder/telemetry/latest.json
+sudo -u encoder tail /home/encoder/.local/state/youtube-autoencoder/telemetry/"$(date -u +%F)".jsonl
+```
+
+For user mode:
+
+```bash
+systemctl --user status youtube-autoencoder-telemetry.timer
+journalctl --user -u youtube-autoencoder-telemetry.service
+python3 -m json.tool ~/.local/state/youtube-autoencoder/telemetry/latest.json
+tail ~/.local/state/youtube-autoencoder/telemetry/"$(date -u +%F)".jsonl
+```
+
+For system mode, disable the timer before setting `YTA_TELEMETRY_ENABLED=false`:
+
+```bash
+sudo systemctl disable --now youtube-autoencoder-telemetry@encoder.timer
+```
+
+For user mode:
+
+```bash
+systemctl --user disable --now youtube-autoencoder-telemetry.timer
+```
+
+Each eligible collection performs one [`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list) call costing one YouTube Data API quota unit. One five-minute timer can therefore consume at most 288 units per 24 hours. This feature adds no separately priced service, package, external storage, or compute dependency. `concurrent_viewers` is nullable because YouTube may omit it when a stream is not actively reporting that value.
+
 ## Caveats
 
 - YouTube Live must already be enabled on the channel. New or restricted channels may not be allowed to stream immediately.
@@ -412,6 +499,8 @@ youtube-autoencoder-api complete
 - Google OAuth app restrictions can block authorization if the app is limited to an organization that does not include the streaming account.
 - A source that passes its probe and then fails can leave one marked unlisted upcoming event. Recovery reuses that event; it does not create another generation.
 - YouTube API quota, API outages, or account policy restrictions can prevent lifecycle operations even when FFmpeg is healthy.
+- Optional telemetry consumes Data API quota independently of lifecycle operations; keep exactly one timer mode active and account for its maximum 288 units per day.
+- Telemetry statistics are aggregate snapshots. `concurrent_viewers` and other fields may be `null` when YouTube omits them, and the collector intentionally does not backfill YouTube Analytics or Reporting data.
 - Recovery reuses one exactly marked nonterminal broadcast. A new generation is permitted only after the previous managed event is `complete`, `revoked`, or confirmed missing.
 - Broadcasts created by older releases do not contain ownership markers. They are not adopted or deleted automatically; inventory and clean up legacy duplicates separately after verifying their lifecycle and watch URLs.
 - A live broadcast cannot return to a scheduled or testing state. After an event reaches `live`, recovery preserves it until an operator explicitly completes it.
@@ -428,9 +517,10 @@ youtube-autoencoder-api complete
 
 Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full history.
 
-### 2026-07-11 - Pre-Ingest Broadcast Staging
+### 2026-07-11 - Optional Video Telemetry
 
-- Reconciles every startup before FFmpeg ingest, stages and binds one marked unlisted event when needed, blocks unmarked bound conflicts, revalidates cached public events after ingest, and logs structured API operation and rate-limit details without exposing credentials.
+- Added disabled-by-default, quota-bounded aggregate video telemetry through one read-only `videos.list` call per eligible collection, with private local snapshots, write-ahead throttling, retention, and independent system or user timers.
+- Telemetry remains isolated from FFmpeg supervision, broadcast recovery, lifecycle transitions, privacy changes, and retry state.
 
 ## Repository Layout
 
@@ -438,9 +528,14 @@ Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full 
 bin/youtube-autoencoder              Production FFmpeg and lifecycle supervisor
 bin/youtube-autoencoder-api          YouTube OAuth and Live Streaming API helper
 bin/youtube-autoencoder-test-pattern Temporary moving test-pattern stream
+bin/youtube-autoencoder-telemetry    Optional private video telemetry collector
 config/youtube-autoencoder.env.example
 systemd/youtube-autoencoder@.service System service template
+systemd/youtube-autoencoder-telemetry@.service System telemetry one-shot template
+systemd/youtube-autoencoder-telemetry@.timer System telemetry timer template
 systemd/user/youtube-autoencoder.service User service template
+systemd/user/youtube-autoencoder-telemetry.service User telemetry one-shot
+systemd/user/youtube-autoencoder-telemetry.timer User telemetry timer
 docs/architecture-and-flows.md       Architecture and operational flow diagrams
 docs/raspberry-pi.md                 Raspberry Pi deployment notes
 CHANGELOG.md                         Full project changelog

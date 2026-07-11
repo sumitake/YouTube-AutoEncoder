@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MPL-2.0
+"""Collect quota-bounded, aggregate YouTube video telemetry."""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+HOME = pathlib.Path.home()
+CONFIG_DIR = pathlib.Path(os.environ.get("YTA_CONFIG_DIR", HOME / ".config/youtube-autoencoder")).expanduser()
+LIFECYCLE_FILE = pathlib.Path(
+    os.environ.get("YTA_YOUTUBE_STATE_FILE", CONFIG_DIR / "youtube-live-state.json")
+).expanduser()
+TELEMETRY_DIR = pathlib.Path(
+    os.environ.get("YTA_TELEMETRY_DIR", HOME / ".local/state/youtube-autoencoder/telemetry")
+).expanduser()
+TELEMETRY_API = os.environ.get("YTA_TELEMETRY_API", "/usr/local/bin/youtube-autoencoder-api")
+
+
+class TelemetryError(RuntimeError):
+    """Raised when local telemetry data is invalid or cannot be persisted."""
+
+
+class HelperError(TelemetryError):
+    """Raised when the read-only metrics helper fails or returns invalid output."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        return_code: int | None = None,
+        retry_class: str = "helper",
+        http_status: int | None = None,
+        reasons: tuple[str, ...] = ("helper_failed",),
+    ) -> None:
+        super().__init__(reason)
+        self.return_code = return_code
+        self.retry_class = retry_class
+        self.http_status = http_status
+        self.reasons = reasons
+
+
+VIDEO_TIMESTAMP_FIELDS = (
+    "actual_start_time",
+    "actual_end_time",
+    "scheduled_start_time",
+    "scheduled_end_time",
+)
+VIDEO_METRIC_FIELDS = ("concurrent_viewers", "view_count", "like_count", "comment_count")
+VIDEO_FIELDS = ("video_id", *VIDEO_TIMESTAMP_FIELDS, *VIDEO_METRIC_FIELDS)
+SAMPLE_CONTEXT_FIELDS = ("instance_id", "generation_id", "broadcast_id", "lifecycle", "privacy")
+REASON_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+DAILY_FILE_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})\.jsonl\Z")
+
+
+def parse_utc(value: str, field: str) -> dt.datetime:
+    if not isinstance(value, str):
+        raise TelemetryError(f"invalid {field}")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise TelemetryError(f"invalid {field}") from exc
+    if parsed.tzinfo is None:
+        raise TelemetryError(f"invalid {field}")
+    return parsed.astimezone(dt.UTC)
+
+
+def read_json(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TelemetryError("invalid lifecycle state") from exc
+    if not isinstance(data, dict):
+        raise TelemetryError("invalid lifecycle state")
+    return data
+
+
+def fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def durable_json(path: pathlib.Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(data, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def telemetry_enabled() -> bool:
+    return os.environ.get("YTA_TELEMETRY_ENABLED", "").casefold() in {"1", "true"}
+
+
+def telemetry_min_interval() -> int:
+    try:
+        configured = int(os.environ.get("YTA_TELEMETRY_MIN_INTERVAL_SEC", "300"))
+    except ValueError:
+        configured = 300
+    return max(300, configured)
+
+
+def utc_text(value: dt.datetime) -> str:
+    return value.astimezone(dt.UTC).isoformat().replace("+00:00", "Z")
+
+
+def read_collector_state() -> dict[str, Any]:
+    path = TELEMETRY_DIR / "collector-state.json"
+    if not path.exists():
+        return {}
+    try:
+        data = read_json(path)
+    except TelemetryError as exc:
+        raise TelemetryError("invalid collector state") from exc
+    for field in ("last_attempt_at", "last_success_at"):
+        if field in data:
+            parse_utc(data[field], field)
+    return data
+
+
+@contextlib.contextmanager
+def telemetry_lock():
+    TELEMETRY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(TELEMETRY_DIR, 0o700)
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(TELEMETRY_DIR / "telemetry.lock", flags, 0o600)
+    acquired = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def eligibility(state: dict[str, Any], collector_state: dict[str, Any], now: dt.datetime) -> tuple[bool, str]:
+    if state.get("lifecycle") != "live":
+        return False, "not_live"
+    broadcast_id = state.get("broadcast_id")
+    if not isinstance(broadcast_id, str) or not broadcast_id:
+        return False, "missing_broadcast"
+    retry_not_before = state.get("retry_not_before")
+    if retry_not_before is not None:
+        if now < parse_utc(retry_not_before, "retry_not_before"):
+            return False, "lifecycle_cooldown"
+    last_attempt_at = collector_state.get("last_attempt_at")
+    if last_attempt_at is not None:
+        attempt = parse_utc(last_attempt_at, "last_attempt_at")
+        if now < attempt + dt.timedelta(seconds=telemetry_min_interval()):
+            return False, "telemetry_cooldown"
+    return True, "eligible"
+
+
+def helper_failure_from_stderr(return_code: int, stderr: str) -> HelperError:
+    retry_class = "helper"
+    http_status = None
+    reasons: tuple[str, ...] = ("helper_failed",)
+    try:
+        error_data = json.loads(stderr)
+    except (TypeError, json.JSONDecodeError):
+        error_data = None
+    if isinstance(error_data, dict):
+        candidate_retry = error_data.get("retry_class")
+        if isinstance(candidate_retry, str) and REASON_IDENTIFIER.fullmatch(candidate_retry):
+            retry_class = candidate_retry
+        candidate_status = error_data.get("http_status")
+        if isinstance(candidate_status, int) and not isinstance(candidate_status, bool):
+            http_status = candidate_status
+        candidate_reasons = error_data.get("reasons")
+        if isinstance(candidate_reasons, list) and all(
+            isinstance(item, str) and REASON_IDENTIFIER.fullmatch(item) for item in candidate_reasons
+        ):
+            reasons = tuple(candidate_reasons) or reasons
+    return HelperError(
+        "helper failed",
+        return_code=return_code,
+        retry_class=retry_class,
+        http_status=http_status,
+        reasons=reasons,
+    )
+
+
+def validate_video_metrics(data: Any, video_id: str) -> dict[str, Any]:
+    if not isinstance(data, dict) or set(data) != set(VIDEO_FIELDS):
+        raise HelperError("invalid helper payload", reasons=("invalid_payload",))
+    if not isinstance(data["video_id"], str) or not data["video_id"]:
+        raise HelperError("invalid helper payload", reasons=("invalid_payload",))
+    if data["video_id"] != video_id:
+        raise HelperError("unexpected video id", reasons=("video_id_mismatch",))
+    for field in VIDEO_TIMESTAMP_FIELDS:
+        if data[field] is not None and not isinstance(data[field], str):
+            raise HelperError("invalid helper payload", reasons=("invalid_timestamp",))
+    for field in VIDEO_METRIC_FIELDS:
+        value = data[field]
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise HelperError("invalid helper payload", reasons=("invalid_metric",))
+    return data
+
+
+def invoke_video_metrics(video_id: str) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            [TELEMETRY_API, "video-metrics", video_id],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HelperError("helper timed out", retry_class="timeout", reasons=("timeout",)) from exc
+    if result.returncode != 0:
+        raise helper_failure_from_stderr(result.returncode, result.stderr)
+    try:
+        data = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HelperError("invalid helper payload", reasons=("invalid_payload",)) from exc
+    return validate_video_metrics(data, video_id)
+
+
+def append_jsonl(path: pathlib.Path, data: dict[str, Any]) -> None:
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(json.dumps(data, sort_keys=True, separators=(",", ":")))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def telemetry_retention_days() -> int:
+    try:
+        configured = int(os.environ.get("YTA_TELEMETRY_RETENTION_DAYS", "30"))
+    except ValueError:
+        configured = 30
+    return max(1, configured)
+
+
+def prune_daily_files(now: dt.datetime) -> None:
+    cutoff = now.astimezone(dt.UTC).date() - dt.timedelta(days=telemetry_retention_days() - 1)
+    try:
+        entries = list(TELEMETRY_DIR.iterdir())
+    except FileNotFoundError:
+        return
+    for path in entries:
+        match = DAILY_FILE_NAME.fullmatch(path.name)
+        if match is None:
+            continue
+        try:
+            file_date = dt.date.fromisoformat(match.group(1))
+            metadata = path.lstat()
+        except (FileNotFoundError, ValueError):
+            continue
+        if file_date < cutoff and stat.S_ISREG(metadata.st_mode):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+
+
+def validate_sample_context(state: dict[str, Any]) -> dict[str, str]:
+    context = {field: state.get(field) for field in SAMPLE_CONTEXT_FIELDS}
+    if not all(isinstance(value, str) and value for value in context.values()):
+        raise TelemetryError("invalid lifecycle context")
+    if context["lifecycle"] != "live":
+        raise TelemetryError("invalid lifecycle context")
+    return context
+
+
+def sample_for(context: dict[str, str], video: dict[str, Any], now: dt.datetime) -> dict[str, Any]:
+    return {"collected_at": utc_text(now), **context, "video": video}
+
+
+def log_helper_error(error: HelperError) -> None:
+    print(
+        json.dumps(
+            {
+                "operation": "video-metrics",
+                "return_code": error.return_code,
+                "retry_class": error.retry_class,
+                "http_status": error.http_status,
+                "reasons": list(error.reasons),
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def helper_error_status(error: HelperError) -> int:
+    return_code = error.return_code
+    if isinstance(return_code, int) and not isinstance(return_code, bool) and 1 <= return_code <= 255:
+        return return_code
+    return 1
+
+
+def log_skip(reason: str) -> None:
+    print(json.dumps({"skip_reason": reason}, sort_keys=True), file=sys.stderr, flush=True)
+
+
+def collect_once(now: dt.datetime | None = None) -> int:
+    if not telemetry_enabled():
+        log_skip("disabled")
+        return 0
+    current = now or dt.datetime.now(dt.UTC)
+    current = current.astimezone(dt.UTC)
+    if not LIFECYCLE_FILE.exists():
+        log_skip("missing_lifecycle")
+        return 0
+    try:
+        state = read_json(LIFECYCLE_FILE)
+        eligible, _reason = eligibility(state, {}, current)
+    except TelemetryError:
+        return 1
+    if not eligible:
+        log_skip(_reason)
+        return 0
+    try:
+        with telemetry_lock() as acquired:
+            if not acquired:
+                log_skip("lock_held")
+                return 0
+            if not LIFECYCLE_FILE.exists():
+                log_skip("missing_lifecycle")
+                return 0
+            state = read_json(LIFECYCLE_FILE)
+            collector_state = read_collector_state()
+            eligible, _reason = eligibility(state, collector_state, current)
+            if not eligible:
+                log_skip(_reason)
+                return 0
+            context = validate_sample_context(state)
+            collector_state["last_attempt_at"] = utc_text(current)
+            durable_json(TELEMETRY_DIR / "collector-state.json", collector_state)
+            try:
+                video = invoke_video_metrics(state["broadcast_id"])
+            except HelperError as exc:
+                log_helper_error(exc)
+                return helper_error_status(exc)
+            sample = sample_for(context, video, current)
+            append_jsonl(TELEMETRY_DIR / f"{current:%Y-%m-%d}.jsonl", sample)
+            durable_json(TELEMETRY_DIR / "latest.json", sample)
+            collector_state["last_success_at"] = utc_text(current)
+            durable_json(TELEMETRY_DIR / "collector-state.json", collector_state)
+            prune_daily_files(current)
+    except (OSError, TelemetryError, subprocess.SubprocessError):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(collect_once())

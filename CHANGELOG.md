@@ -2,6 +2,12 @@
 
 All notable project changes are recorded here. The README shows only the most recent entry.
 
+## 2026-07-11 - Optional Video Telemetry
+
+- Added an opt-in `videos.list` command and one-shot collector for aggregate live-stream timing, viewer, view, like, and comment metrics.
+- Added private local latest and daily JSONL samples, strict payload validation, a nonblocking lock, write-ahead quota throttling, and configurable retention.
+- Added independent system and user five-minute timers that remain disabled after installation; one selected timer consumes at most 288 quota units per 24 hours at the minimum interval and never controls stream recovery.
+
 ## 2026-07-11 - Pre-Ingest Broadcast Staging
 
 - Reordered every recovery, including cached public state, so one marked broadcast is reconciled, created unlisted if needed, and bound before FFmpeg starts ingest; startup API failures now fail closed.
