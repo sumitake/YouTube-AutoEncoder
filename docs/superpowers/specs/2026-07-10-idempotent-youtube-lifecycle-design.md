@@ -34,7 +34,7 @@ The design is based on direct observation of the current Raspberry Pi deployment
 - Stop API hammering through bounded polling and persisted backoff.
 - Detect FFmpeg exit and stalled media while waiting on YouTube.
 - Keep copy mode as the low-resource default when YouTube accepts its output.
-- Remain recoverable after a hard power loss corrupts or loses local cache state.
+- Recover after hard power loss while durable state remains intact, and fail closed rather than duplicate when marker-free state is lost.
 - Preserve existing unrelated or ambiguous YouTube resources unless cleanup is explicitly authorized.
 
 ## Non-Goals
@@ -88,7 +88,7 @@ References:
 
 ### Source Of Truth
 
-YouTube is authoritative for stream and broadcast lifecycle. The local state file is a durable recovery cache, not an authority that can override remote state.
+YouTube is authoritative for stream and broadcast lifecycle. The private local state file is the durable ownership record and recovery cache; it cannot override remote lifecycle or stream binding.
 
 On every startup and before every mutation, the helper validates local IDs against YouTube. A missing, corrupt, or stale state file triggers remote reconciliation before any create operation.
 
@@ -96,22 +96,11 @@ On every startup and before every mutation, the helper validates local IDs again
 
 A stable `YTA_INSTANCE_ID` identifies one encoder deployment. The Pi will use `rpi5-streamer`; a generic installation may default to a sanitized hostname but should set an explicit value for durable identity.
 
-Before an insert, the helper creates a generation UUID and durably records a `create` intent. Each new broadcast includes exact machine-readable instance and generation markers such as:
+Schema v3 never sets or updates YouTube `liveBroadcast` or `liveStream` descriptions. The exact broadcast ID in the mode-0600 state file is the normal ownership proof. A scoped schema-v2 state with an ID migrates by fetching and validating that exact resource; legacy description markers are read only when an interrupted schema-v2 create or missing state must be reconciled.
 
-```text
-[youtube-autoencoder-instance:rpi5-streamer]
-[youtube-autoencoder-generation:7ecbc64c-c31c-4f4d-952b-4bfd70e3ce36]
-```
+Before a new insert, the helper creates a local generation UUID and durably records title, whole-second scheduled start, staging privacy, reusable stream ID, and creation-intent time. It fsyncs `pending_action=verify_create` before the network call. If the response is lost, recovery lists active and upcoming events and may adopt exactly one candidate matching the normalized fingerprint, expected content settings, compatible binding, and bounded publication window. Zero or multiple matches remain blocked and never authorize another insert.
 
-A remote broadcast is adoptable only when all of these are true:
-
-- The instance marker exactly matches the configured instance ID.
-- The generation marker matches the durable write-ahead intent when recovery is completing an uncertain insert.
-- The broadcast is bound to the configured reusable stream, or is the locally recorded result of an insert that still needs binding.
-- Its lifecycle is one of the explicitly recoverable states.
-- No second matching candidate makes ownership ambiguous.
-
-Title-prefix matching alone is never sufficient.
+Title matching alone is never sufficient. When state is missing, any recoverable same-stream or unbound same-title event blocks creation unless one exact legacy marker candidate can be migrated.
 
 ## Lifecycle State Machine
 
@@ -119,8 +108,8 @@ Title-prefix matching alone is never sufficient.
 stateDiagram-v2
     [*] --> WaitForSource
     WaitForSource --> ReconcileBroadcast: source probe passes
-    ReconcileBroadcast --> Blocked: ambiguous, unknown, or unmarked bound event
-    ReconcileBroadcast --> StartEncoder: marked unlisted broadcast is bound
+    ReconcileBroadcast --> Blocked: ambiguous, unknown, or unowned bound event
+    ReconcileBroadcast --> StartEncoder: owned unlisted broadcast is bound
     StartEncoder --> WaitForSource: FFmpeg exits or stalls
     StartEncoder --> WaitForIngest: media progress observed
     WaitForIngest --> WaitForSource: FFmpeg exits or stalls
@@ -159,18 +148,18 @@ Only a terminal state permits a new broadcast generation. Unknown lifecycle valu
 1. Resolve the reusable stream and its stream ID.
 2. Read the local cache. If it is malformed, rename it to a timestamped `.corrupt` file and continue without trusting it.
 3. If the cache contains a broadcast ID, fetch that broadcast by ID.
-4. Verify the instance marker, stream relationship, and lifecycle.
-5. List owned active and upcoming event broadcasts before starting FFmpeg.
-6. Block if any unmarked recoverable broadcast is bound to the reusable stream; automatic legacy adoption is prohibited.
-7. Filter remaining candidates by exact instance and generation markers and adopt exactly one match.
-8. If multiple marked matches exist, enter a blocked state and create nothing.
-9. If no match exists, generate or retain one generation ID and durably persist a `create` intent before the API call.
-10. Reconcile once more for that exact generation marker, then create one unlisted broadcast only if it still does not exist.
+4. Verify the exact cached ID, stream relationship, and lifecycle without reading its description.
+5. List active and upcoming event broadcasts before starting FFmpeg and block conflicting resources bound to the reusable stream.
+6. For schema-v2 migration only, adopt exactly one compatible candidate with exact legacy instance and generation markers.
+7. If schema-v3 state is `verify_create`, filter by the persisted normalized fingerprint and adopt exactly one match; zero or multiple matches remain blocked.
+8. If safe creation is permitted, generate or retain one local generation and durably persist the required insert fields with `pending_action=create`.
+9. Fsync `pending_action=verify_create` before calling `liveBroadcasts.insert` without a description field.
+10. Restore `pending_action=create` only after an explicit non-5xx rejection other than HTTP 408. Timeouts, HTTP 408, 5xx responses, malformed success responses, or process death remain verification-only.
 11. Persist the returned broadcast ID immediately, marking binding as pending.
 12. Bind it to the reusable stream, persist the updated state, and only then permit FFmpeg ingest to start.
 13. Require fresh active ingest before `testing` or `live`, and repeat remote validation before every subsequent mutation.
 
-If an insert request times out after YouTube may have accepted it, the next attempt searches for the exact persisted generation marker before another insert. This closes the lost-response orphan window without relying on title or creation-time heuristics.
+An uncertain insert is polled indefinitely through persisted ambiguous backoff, capped at one hour between attempts. It never becomes eligible for another automatic insert. This is the no-duplicate tradeoff required because YouTube exposes no documented idempotency key or private application metadata field.
 
 ## Transition And Publication Gates
 
@@ -337,17 +326,18 @@ The implementation adds or formalizes:
 - FFmpeg arguments omit unsupported `-rw_timeout`.
 - Capability checks include or omit `-timeout` correctly and time out safely.
 - Source failure performs no YouTube broadcast operation.
-- One marked unlisted broadcast is staged and bound before FFmpeg starts.
-- An unmarked recoverable event bound to the reusable stream blocks before ingest.
+- One description-neutral unlisted broadcast is staged and bound before FFmpeg starts.
+- An unowned recoverable event bound to the reusable stream blocks before ingest.
 - FFmpeg exit before active ingest retains the staged event and performs no transition.
 - Stale media progress terminates FFmpeg and blocks lifecycle mutation.
 - Cached `created`, `ready`, `testStarting`, `testing`, `liveStarting`, and `live` broadcasts are reused.
 - `complete`, `revoked`, or confirmed missing broadcasts permit one replacement.
 - Unknown lifecycle values block creation.
-- A write-ahead generation is durable before insert, and a lost insert response is reconciled by exact generation marker before retry.
-- Insert throttling retains the same pending generation, and bind failure retries the same broadcast ID without reinserting.
+- A schema-v3 create fingerprint is durable before insert, and a lost response enters verification-only recovery without reinserting.
+- Explicit insert rejection can retry with a fresh future start time, while ambiguous failure retains `verify_create`; bind failure retries the same broadcast ID.
 - A crash after insert and before bind resumes binding the same ID.
-- Multiple exact marker matches block automatic adoption and insertion.
+- Multiple exact fingerprint or legacy-marker matches block automatic adoption and insertion.
+- Both live-stream and broadcast insert payloads omit the description key, and privacy updates remain status-only.
 - Unrelated title-prefix matches are ignored.
 - Child and ingest health are checked before each transition.
 - Child failure after live transition but before publication cannot publish the event.
@@ -384,7 +374,7 @@ The implementation adds or formalizes:
 7. Record the broadcast ID and watch URL.
 8. Kill FFmpeg and prove the same broadcast ID returns to healthy live streaming.
 9. Restart the systemd service and prove the same broadcast ID returns again.
-10. Confirm no additional exact-marker broadcast was created and the scheduled-event count did not increase during either recovery test.
+10. Confirm no additional broadcast was created and the scheduled-event count did not increase during either recovery test.
 11. Confirm the service is enabled and Raspberry Pi Connect and the VS Code Remote Tunnel remain operational.
 
 ## Deployment Flow
@@ -427,7 +417,7 @@ The rollback procedure will be exercised for local files and systemd before fina
 
 The repair will inventory active and upcoming broadcasts after the service is stopped. It will report IDs, titles, lifecycle states, privacy, scheduled times, and bound stream IDs without exposing secrets.
 
-The new instance marker will not match legacy duplicates, so they cannot be adopted accidentally. Static duplicates do not themselves spend request quota, but they may clutter YouTube Studio or interfere with stream binding. Completing, unbinding, privatizing, or deleting them is a separate external mutation that requires an explicit cleanup decision based on the inventory.
+Schema-v3 exact-ID state and conservative conflict checks prevent legacy duplicates from being adopted accidentally. Static duplicates do not themselves spend request quota, but they may clutter YouTube Studio or interfere with stream binding. Completing, unbinding, privatizing, deleting, or changing their descriptions is a separate external mutation that requires an explicit cleanup decision based on the inventory.
 
 ## Acceptance Criteria
 
@@ -437,7 +427,7 @@ The new instance marker will not match legacy duplicates, so they cannot be adop
 - FFmpeg and service restart tests preserve the same broadcast ID and watch URL.
 - No recovery test increases the number of managed scheduled broadcasts.
 - API rate-limit errors produce persisted cooldown rather than ten-second retries.
-- Power-loss cache scenarios reconcile from YouTube without duplicate creation.
+- Power-loss recovery preserves the exact broadcast ID when state survives and fails closed without duplicate creation when marker-free state is lost.
 - The service remains enabled under systemd and remote-management services remain available.
 - Existing legacy duplicates are reported but unchanged.
 

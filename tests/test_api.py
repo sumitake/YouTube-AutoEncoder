@@ -11,16 +11,40 @@ import uuid
 import pytest
 
 
-def managed_broadcast(api, broadcast_id, lifecycle, *, generation="generation-1", stream_id="stream-1"):
+def managed_broadcast(
+    api,
+    broadcast_id,
+    lifecycle,
+    *,
+    generation="generation-1",
+    stream_id="stream-1",
+    description=None,
+    scheduled_start_time="2026-07-10T21:00:00Z",
+    published_at="2026-07-10T20:59:00Z",
+):
+    if description is None:
+        description = "\n".join(
+            [
+                "Managed by YouTube AutoEncoder.",
+                "",
+                api.instance_marker("encoder-1"),
+                api.generation_marker(generation),
+            ]
+        )
     return {
         "id": broadcast_id,
         "snippet": {
             "title": "Camera Live",
-            "description": api.broadcast_description("encoder-1", generation),
-            "scheduledStartTime": "2026-07-10T21:00:00Z",
+            "description": description,
+            "scheduledStartTime": scheduled_start_time,
+            "publishedAt": published_at,
         },
         "contentDetails": {
             "boundStreamId": stream_id,
+            "enableAutoStart": False,
+            "enableAutoStop": False,
+            "enableDvr": True,
+            "recordFromStart": True,
             "monitorStream": {"enableMonitorStream": True, "broadcastStreamDelayMs": 0},
         },
         "status": {
@@ -279,26 +303,309 @@ def test_create_broadcast_payload(load_script, monkeypatch):
 
     monkeypatch.setattr(api, "api", fake_api)
 
-    result = api.create_broadcast("Camera Live", "unlisted")
+    result = api.create_broadcast(
+        "Camera Live",
+        "unlisted",
+        scheduled_start_time="2026-07-12T01:02:03Z",
+    )
 
     assert result == {"id": "broadcast-id"}
     assert calls[0]["method"] == "POST"
     assert calls[0]["path"] == "/liveBroadcasts"
     assert calls[0]["params"] == {"part": "snippet,contentDetails,status"}
     assert calls[0]["body"]["snippet"]["title"] == "Camera Live"
-    assert calls[0]["body"]["snippet"]["scheduledStartTime"].endswith("Z")
+    assert calls[0]["body"]["snippet"]["scheduledStartTime"] == "2026-07-12T01:02:03Z"
+    assert "description" not in calls[0]["body"]["snippet"]
     assert calls[0]["body"]["status"]["privacyStatus"] == "unlisted"
     assert calls[0]["body"]["status"]["selfDeclaredMadeForKids"] is False
     assert calls[0]["body"]["contentDetails"]["monitorStream"]["enableMonitorStream"] is True
 
 
-def test_description_contains_exact_instance_and_generation_markers(load_script):
-    api = load_script("youtube-autoencoder-api", "yta_api_markers")
+def test_create_stream_payload_omits_description(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_stream_no_description")
+    calls = []
 
-    description = api.broadcast_description("rpi5-streamer", "generation-1")
+    def fake_api(method, path, params, body=None):
+        calls.append({"method": method, "path": path, "params": params, "body": body})
+        return {"id": "stream-id"}
 
-    assert "[youtube-autoencoder-instance:rpi5-streamer]" in description.splitlines()
-    assert "[youtube-autoencoder-generation:generation-1]" in description.splitlines()
+    monkeypatch.setattr(api, "api", fake_api)
+
+    assert api.create_stream() == {"id": "stream-id"}
+    assert "description" not in calls[0]["body"]["snippet"]
+
+
+def test_legacy_description_markers_remain_readable_for_migration(load_script):
+    api = load_script("youtube-autoencoder-api", "yta_api_legacy_markers")
+    broadcast = {
+        "snippet": {
+            "description": "\n".join(
+                [
+                    "Managed by YouTube AutoEncoder.",
+                    "",
+                    "[youtube-autoencoder-instance:rpi5-streamer]",
+                    "[youtube-autoencoder-generation:generation-1]",
+                ]
+            )
+        }
+    }
+
+    assert api.has_marker(broadcast, api.instance_marker("rpi5-streamer"))
+    assert api.broadcast_generation(broadcast) == "generation-1"
+
+
+def test_reconcile_migrates_v2_cached_id_without_reading_or_writing_description(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_v2_cached_migration")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    api.write_state(
+        {
+            "schema_version": 2,
+            "instance_id": "encoder-1",
+            "generation_id": "generation-1",
+            "stream_id": "stream-1",
+            "broadcast_id": "broadcast-1",
+        }
+    )
+    cached = managed_broadcast(
+        api,
+        "broadcast-1",
+        "live",
+        description="User-authored description that must remain unchanged.",
+    )
+    monkeypatch.setattr(api, "broadcast_by_id", lambda _broadcast_id: cached)
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [cached])
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
+    monkeypatch.setattr(api, "api", lambda *_args, **_kwargs: pytest.fail("description update called"))
+
+    state = api.reconcile_broadcast(
+        stream_id="stream-1",
+        title="Camera Live",
+        staging_privacy="unlisted",
+        allow_create=True,
+        offline_create=True,
+    )
+
+    assert state["schema_version"] == 3
+    assert state["broadcast_id"] == "broadcast-1"
+    assert cached["snippet"]["description"] == "User-authored description that must remain unchanged."
+
+
+def test_reconcile_recovers_uncertain_insert_by_normalized_fingerprint(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_uncertain_fingerprint")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    api.write_state(
+        {
+            "schema_version": 3,
+            "instance_id": "encoder-1",
+            "generation_id": "generation-1",
+            "stream_id": "stream-1",
+            "broadcast_id": None,
+            "pending_action": "verify_create",
+            "title": "Camera Live",
+            "scheduled_start_time": "2026-07-12T01:05:00Z",
+            "create_intent_at": "2026-07-12T01:00:00Z",
+            "last_known_privacy": "unlisted",
+        }
+    )
+    created = managed_broadcast(
+        api,
+        "broadcast-1",
+        "created",
+        stream_id="",
+        description="A channel owner controls this text.",
+        scheduled_start_time="2026-07-12T01:05:00.000+00:00",
+        published_at="2026-07-12T01:00:03.000Z",
+    )
+    bound = {**created, "contentDetails": {**created["contentDetails"], "boundStreamId": "stream-1"}}
+    bound["status"] = {**created["status"], "lifeCycleStatus": "ready"}
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [created])
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
+    monkeypatch.setattr(api, "bind_broadcast", lambda _broadcast_id, _stream_id: bound)
+
+    state = api.reconcile_broadcast(
+        stream_id="stream-1",
+        title="Camera Live",
+        staging_privacy="unlisted",
+        allow_create=True,
+        offline_create=True,
+    )
+
+    assert state["broadcast_id"] == "broadcast-1"
+    assert state["pending_action"] is None
+    assert state["schema_version"] == 3
+
+
+def test_uncertain_insert_without_remote_match_never_inserts(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_uncertain_no_match")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    api.write_state(
+        {
+            "schema_version": 3,
+            "instance_id": "encoder-1",
+            "generation_id": "generation-1",
+            "stream_id": "stream-1",
+            "broadcast_id": None,
+            "pending_action": "verify_create",
+            "title": "Camera Live",
+            "scheduled_start_time": "2026-07-12T01:05:00Z",
+            "create_intent_at": "2026-07-12T01:00:00Z",
+            "last_known_privacy": "unlisted",
+        }
+    )
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [])
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
+
+    with pytest.raises(api.ReconciliationError, match="uncertain"):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+    assert api.read_state()["pending_action"] == "verify_create"
+
+
+def test_uncertain_insert_with_multiple_remote_matches_never_inserts(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_uncertain_multiple")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    api.write_state(
+        {
+            "schema_version": 3,
+            "instance_id": "encoder-1",
+            "generation_id": "generation-1",
+            "stream_id": "stream-1",
+            "broadcast_id": None,
+            "pending_action": "verify_create",
+            "title": "Camera Live",
+            "scheduled_start_time": "2026-07-12T01:05:00Z",
+            "create_intent_at": "2026-07-12T01:00:00Z",
+            "last_known_privacy": "unlisted",
+        }
+    )
+    matches = [
+        managed_broadcast(
+            api,
+            broadcast_id,
+            "created",
+            stream_id="",
+            description="",
+            scheduled_start_time="2026-07-12T01:05:00Z",
+            published_at="2026-07-12T01:00:03Z",
+        )
+        for broadcast_id in ("broadcast-1", "broadcast-2")
+    ]
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: matches)
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
+
+    with pytest.raises(api.ReconciliationError, match="multiple"):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+    assert api.read_state()["pending_action"] == "verify_create"
+
+
+def test_uncertain_insert_rejects_published_at_mismatch(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_uncertain_published_mismatch")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    api.write_state(
+        {
+            "schema_version": 3,
+            "instance_id": "encoder-1",
+            "generation_id": "generation-1",
+            "stream_id": "stream-1",
+            "broadcast_id": None,
+            "pending_action": "verify_create",
+            "title": "Camera Live",
+            "scheduled_start_time": "2026-07-12T01:05:00Z",
+            "create_intent_at": "2026-07-12T01:00:00Z",
+            "last_known_privacy": "unlisted",
+        }
+    )
+    stale = managed_broadcast(
+        api,
+        "broadcast-old",
+        "created",
+        stream_id="",
+        description="Unrelated broadcast.",
+        scheduled_start_time="2026-07-12T01:05:00Z",
+        published_at="2026-07-11T01:00:00Z",
+    )
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [stale])
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
+
+    with pytest.raises(api.ReconciliationError, match="uncertain"):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+
+def test_insert_intent_is_durable_before_call_and_definite_rejection_is_retryable(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_insert_intent")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [])
+    observed = {}
+
+    def reject_insert(title, privacy, *, scheduled_start_time):
+        observed.update(api.read_state())
+        assert title == "Camera Live"
+        assert privacy == "unlisted"
+        assert scheduled_start_time.endswith("Z")
+        raise api.YouTubeApiError(
+            status=403,
+            reasons=("userRequestsExceedRateLimit",),
+            message="rate limited",
+        )
+
+    monkeypatch.setattr(api, "create_broadcast", reject_insert)
+
+    with pytest.raises(api.YouTubeApiError):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+    assert observed["schema_version"] == 3
+    assert observed["pending_action"] == "verify_create"
+    assert observed["scheduled_start_time"]
+    assert observed["create_intent_at"]
+    assert api.read_state()["pending_action"] == "create"
+
+
+def test_ambiguous_insert_failure_remains_verify_only(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_insert_ambiguous")
+    configure_reconciliation(api, monkeypatch, tmp_path)
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [])
+
+    def lose_response(_title, _privacy, *, scheduled_start_time):
+        assert scheduled_start_time
+        raise api.YouTubeApiError(status=None, reasons=(), message="connection lost")
+
+    monkeypatch.setattr(api, "create_broadcast", lose_response)
+
+    with pytest.raises(api.YouTubeApiError):
+        api.reconcile_broadcast(
+            stream_id="stream-1",
+            title="Camera Live",
+            staging_privacy="unlisted",
+            allow_create=True,
+            offline_create=True,
+        )
+
+    assert api.read_state()["pending_action"] == "verify_create"
 
 
 @pytest.mark.parametrize("lifecycle", ["created", "ready", "testStarting", "testing", "liveStarting", "live"])
@@ -345,19 +652,37 @@ def test_reconcile_replaces_terminal_broadcast_once(load_script, monkeypatch, tm
     )
     old = managed_broadcast(api, "old-broadcast", "complete", generation="old-generation")
     new_generation = "00000000-0000-0000-0000-000000000001"
-    created = managed_broadcast(api, "new-broadcast", "created", generation=new_generation, stream_id="")
-    bound = managed_broadcast(api, "new-broadcast", "ready", generation=new_generation)
+    created = {}
     creates = []
     monkeypatch.setattr(api, "broadcast_by_id", lambda broadcast_id: old if broadcast_id == "old-broadcast" else None)
-    monkeypatch.setattr(api, "list_managed_broadcasts", lambda _instance: [])
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [])
     monkeypatch.setattr(api.uuid, "uuid4", lambda: uuid.UUID("00000000-0000-0000-0000-000000000001"))
 
-    def create(title, privacy, description=None):
-        creates.append((title, privacy, description))
+    def create(title, privacy, *, scheduled_start_time):
+        creates.append((title, privacy, scheduled_start_time))
+        created.update(
+            managed_broadcast(
+                api,
+                "new-broadcast",
+                "created",
+                generation=new_generation,
+                stream_id="",
+                description="",
+                scheduled_start_time=scheduled_start_time,
+                published_at=api.read_state()["create_intent_at"],
+            )
+        )
         return created
 
+    def bind(_broadcast_id, _stream_id):
+        return {
+            **created,
+            "contentDetails": {**created["contentDetails"], "boundStreamId": "stream-1"},
+            "status": {**created["status"], "lifeCycleStatus": "ready"},
+        }
+
     monkeypatch.setattr(api, "create_broadcast", create)
-    monkeypatch.setattr(api, "bind_broadcast", lambda _broadcast_id, _stream_id: bound)
+    monkeypatch.setattr(api, "bind_broadcast", bind)
 
     state = api.reconcile_broadcast(
         stream_id="stream-1",
@@ -387,7 +712,7 @@ def test_reconcile_recovers_lost_insert_response_by_generation(load_script, monk
     )
     found = managed_broadcast(api, "broadcast-1", "created", stream_id="")
     bound = managed_broadcast(api, "broadcast-1", "ready")
-    monkeypatch.setattr(api, "list_managed_broadcasts", lambda _instance: [found])
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [found])
     monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
     monkeypatch.setattr(api, "bind_broadcast", lambda _broadcast_id, _stream_id: bound)
 
@@ -406,7 +731,7 @@ def test_reconcile_recovers_generation_from_single_remote_candidate(load_script,
     api = load_script("youtube-autoencoder-api", "yta_api_remote_generation")
     configure_reconciliation(api, monkeypatch, tmp_path)
     found = managed_broadcast(api, "broadcast-1", "live", generation="remote-generation")
-    monkeypatch.setattr(api, "list_managed_broadcasts", lambda _instance: [found])
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [found])
     monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
 
     state = api.reconcile_broadcast(
@@ -427,7 +752,7 @@ def test_reconcile_blocks_multiple_managed_candidates(load_script, monkeypatch, 
         managed_broadcast(api, "broadcast-1", "ready", generation="generation-1"),
         managed_broadcast(api, "broadcast-2", "ready", generation="generation-2"),
     ]
-    monkeypatch.setattr(api, "list_managed_broadcasts", lambda _instance: candidates)
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: candidates)
     monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
 
     with pytest.raises(api.ReconciliationError) as raised:
@@ -455,7 +780,7 @@ def test_reconcile_blocks_conflicting_managed_generation(load_script, monkeypatc
         }
     )
     conflicting = managed_broadcast(api, "broadcast-2", "ready", generation="generation-2")
-    monkeypatch.setattr(api, "list_managed_broadcasts", lambda _instance: [conflicting])
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [conflicting])
     monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
 
     with pytest.raises(api.ReconciliationError, match="generation"):
@@ -471,7 +796,7 @@ def test_reconcile_blocks_unknown_lifecycle(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_unknown_lifecycle")
     configure_reconciliation(api, monkeypatch, tmp_path)
     unknown = managed_broadcast(api, "broadcast-1", "mystery")
-    monkeypatch.setattr(api, "list_managed_broadcasts", lambda _instance: [unknown])
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [unknown])
     monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
 
     with pytest.raises(api.ReconciliationError, match="unknown"):
@@ -487,7 +812,7 @@ def test_reconcile_blocks_broadcast_bound_to_different_stream(load_script, monke
     api = load_script("youtube-autoencoder-api", "yta_api_wrong_stream")
     configure_reconciliation(api, monkeypatch, tmp_path)
     wrong_stream = managed_broadcast(api, "broadcast-1", "ready", stream_id="stream-2")
-    monkeypatch.setattr(api, "list_managed_broadcasts", lambda _instance: [wrong_stream])
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [wrong_stream])
     monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("insert called"))
 
     with pytest.raises(api.ReconciliationError, match="different stream"):
@@ -502,7 +827,7 @@ def test_reconcile_blocks_broadcast_bound_to_different_stream(load_script, monke
 def test_reconcile_refuses_create_until_ingest_is_active(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_ingest_gate")
     configure_reconciliation(api, monkeypatch, tmp_path)
-    monkeypatch.setattr(api, "list_managed_broadcasts", lambda _instance: [])
+    monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [])
     monkeypatch.setattr(
         api,
         "stream_by_id",
@@ -519,9 +844,7 @@ def test_reconcile_refuses_create_until_ingest_is_active(load_script, monkeypatc
         )
 
 
-def test_offline_reconcile_stages_one_unlisted_broadcast_before_ingest(
-    load_script, monkeypatch, tmp_path
-):
+def test_offline_reconcile_stages_one_unlisted_broadcast_before_ingest(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_offline_stage")
     configure_reconciliation(api, monkeypatch, tmp_path)
     monkeypatch.setattr(
@@ -531,17 +854,35 @@ def test_offline_reconcile_stages_one_unlisted_broadcast_before_ingest(
     )
     monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [], raising=False)
     generation = "00000000-0000-0000-0000-000000000001"
-    created = managed_broadcast(api, "broadcast-1", "created", generation=generation, stream_id="")
-    bound = managed_broadcast(api, "broadcast-1", "ready", generation=generation)
+    created = {}
     creates = []
     monkeypatch.setattr(api.uuid, "uuid4", lambda: uuid.UUID(generation))
 
-    def create(title, privacy, description=None):
-        creates.append((title, privacy, description))
+    def create(title, privacy, *, scheduled_start_time):
+        creates.append((title, privacy, scheduled_start_time))
+        created.update(
+            managed_broadcast(
+                api,
+                "broadcast-1",
+                "created",
+                generation=generation,
+                stream_id="",
+                description="",
+                scheduled_start_time=scheduled_start_time,
+                published_at=api.read_state()["create_intent_at"],
+            )
+        )
         return created
 
+    def bind(_broadcast_id, _stream_id):
+        return {
+            **created,
+            "contentDetails": {**created["contentDetails"], "boundStreamId": "stream-1"},
+            "status": {**created["status"], "lifeCycleStatus": "ready"},
+        }
+
     monkeypatch.setattr(api, "create_broadcast", create)
-    monkeypatch.setattr(api, "bind_broadcast", lambda _broadcast_id, _stream_id: bound)
+    monkeypatch.setattr(api, "bind_broadcast", bind)
 
     state = api.reconcile_broadcast(
         stream_id="stream-1",
@@ -557,9 +898,7 @@ def test_offline_reconcile_stages_one_unlisted_broadcast_before_ingest(
     assert state["privacy"] == "unlisted"
 
 
-def test_offline_reconcile_blocks_unmarked_broadcast_bound_to_same_stream(
-    load_script, monkeypatch, tmp_path
-):
+def test_offline_reconcile_blocks_unmarked_broadcast_bound_to_same_stream(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_offline_unmarked_conflict")
     configure_reconciliation(api, monkeypatch, tmp_path)
     unmarked = {
@@ -581,9 +920,7 @@ def test_offline_reconcile_blocks_unmarked_broadcast_bound_to_same_stream(
         )
 
 
-def test_offline_reconcile_checks_unmarked_conflicts_with_cached_managed_broadcast(
-    load_script, monkeypatch, tmp_path
-):
+def test_offline_reconcile_checks_unmarked_conflicts_with_cached_managed_broadcast(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_offline_cached_conflict")
     configure_reconciliation(api, monkeypatch, tmp_path)
     api.write_state(
@@ -631,7 +968,7 @@ def test_offline_reconcile_refuses_public_staging(load_script, monkeypatch, tmp_
         )
 
 
-def test_offline_insert_throttle_preserves_write_ahead_generation(load_script, monkeypatch, tmp_path):
+def test_legacy_uncertain_insert_without_remote_marker_fails_closed(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_offline_insert_throttle")
     configure_reconciliation(api, monkeypatch, tmp_path)
     api.write_state(
@@ -647,17 +984,9 @@ def test_offline_insert_throttle_preserves_write_ahead_generation(load_script, m
     monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: [])
     creates = []
 
-    def throttled_insert(*_args, **_kwargs):
-        creates.append(True)
-        raise api.YouTubeApiError(
-            status=403,
-            reasons=("userRequestsExceedRateLimit",),
-            message="User requests exceed the rate limit.",
-        )
+    monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: creates.append(True))
 
-    monkeypatch.setattr(api, "create_broadcast", throttled_insert)
-
-    with pytest.raises(api.YouTubeApiError):
+    with pytest.raises(api.ReconciliationError, match="uncertain"):
         api.reconcile_broadcast(
             stream_id="stream-1",
             title="Camera Live",
@@ -667,27 +996,37 @@ def test_offline_insert_throttle_preserves_write_ahead_generation(load_script, m
         )
 
     state = api.read_state()
-    assert creates == [True]
+    assert creates == []
+    assert state["schema_version"] == 2
     assert state["generation_id"] == "generation-1"
     assert state["broadcast_id"] is None
     assert state["pending_action"] == "create"
 
 
-def test_offline_bind_failure_reuses_persisted_broadcast_without_reinsert(
-    load_script, monkeypatch, tmp_path
-):
+def test_offline_bind_failure_reuses_persisted_broadcast_without_reinsert(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_offline_bind_retry")
     configure_reconciliation(api, monkeypatch, tmp_path)
     generation = "00000000-0000-0000-0000-000000000001"
-    created = managed_broadcast(api, "broadcast-1", "created", generation=generation, stream_id="")
-    bound = managed_broadcast(api, "broadcast-1", "ready", generation=generation)
+    created = {}
     inventory = []
     creates = []
     monkeypatch.setattr(api.uuid, "uuid4", lambda: uuid.UUID(generation))
     monkeypatch.setattr(api, "list_recoverable_broadcasts", lambda: list(inventory))
 
-    def create(*_args, **_kwargs):
+    def create(_title, _privacy, *, scheduled_start_time):
         creates.append(True)
+        created.update(
+            managed_broadcast(
+                api,
+                "broadcast-1",
+                "created",
+                generation=generation,
+                stream_id="",
+                description="",
+                scheduled_start_time=scheduled_start_time,
+                published_at=api.read_state()["create_intent_at"],
+            )
+        )
         inventory[:] = [created]
         return created
 
@@ -713,7 +1052,15 @@ def test_offline_bind_failure_reuses_persisted_broadcast_without_reinsert(
 
     monkeypatch.setattr(api, "broadcast_by_id", lambda _broadcast_id: created)
     monkeypatch.setattr(api, "create_broadcast", lambda *_args, **_kwargs: pytest.fail("second insert called"))
-    monkeypatch.setattr(api, "bind_broadcast", lambda *_args: bound)
+    monkeypatch.setattr(
+        api,
+        "bind_broadcast",
+        lambda *_args: {
+            **created,
+            "contentDetails": {**created["contentDetails"], "boundStreamId": "stream-1"},
+            "status": {**created["status"], "lifeCycleStatus": "ready"},
+        },
+    )
 
     recovered = api.reconcile_broadcast(
         stream_id="stream-1",
@@ -1061,32 +1408,36 @@ def test_video_metrics_uses_one_read_only_videos_list_call(load_script, monkeypa
     def request(method, path, params, body=None):
         calls.append((method, path, params, body))
         return {
-            "items": [{
-                "id": "video-1",
-                "liveStreamingDetails": {
-                    "actualStartTime": "2026-07-11T00:00:00Z",
-                    "concurrentViewers": "12",
-                },
-                "statistics": {"viewCount": "345", "likeCount": "6", "commentCount": "2"},
-            }]
+            "items": [
+                {
+                    "id": "video-1",
+                    "liveStreamingDetails": {
+                        "actualStartTime": "2026-07-11T00:00:00Z",
+                        "concurrentViewers": "12",
+                    },
+                    "statistics": {"viewCount": "345", "likeCount": "6", "commentCount": "2"},
+                }
+            ]
         }
 
     monkeypatch.setattr(api, "api", request)
     result = api.video_metrics("video-1")
 
-    assert calls == [(
-        "GET",
-        "/videos",
-        {
-            "id": "video-1",
-            "part": "liveStreamingDetails,statistics",
-            "fields": (
-                "items(id,liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,"
-                "scheduledEndTime,concurrentViewers),statistics(viewCount,likeCount,commentCount))"
-            ),
-        },
-        None,
-    )]
+    assert calls == [
+        (
+            "GET",
+            "/videos",
+            {
+                "id": "video-1",
+                "part": "liveStreamingDetails,statistics",
+                "fields": (
+                    "items(id,liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,"
+                    "scheduledEndTime,concurrentViewers),statistics(viewCount,likeCount,commentCount))"
+                ),
+            },
+            None,
+        )
+    ]
     assert result["concurrent_viewers"] == 12
     assert result["view_count"] == 345
 
