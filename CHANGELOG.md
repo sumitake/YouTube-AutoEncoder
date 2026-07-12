@@ -2,6 +2,12 @@
 
 All notable project changes are recorded here. The README shows only the most recent entry.
 
+## 2026-07-11 - Description-Neutral Lifecycle Identity
+
+- Stopped setting `liveBroadcast` and `liveStream` descriptions; new insert payloads omit the description field entirely and privacy updates remain status-only.
+- Replaced description-marker ownership with schema-v3 exact-ID state and a durable normal-field fingerprint for verification-only recovery after an ambiguous insert.
+- Added one-way read-only migration for schema-v2 markers, conservative state-loss conflict handling, and regression coverage for every insert crash boundary.
+
 ## 2026-07-11 - Live Visibility Publication Fix
 
 - Corrected privacy-only `liveBroadcasts.update` requests so `part=status` sends only the matching `id` and `status` resource fields, eliminating HTTP 400 `unexpectedPart` failures after the healthy-live gate.

@@ -55,12 +55,14 @@ RATE_LIMIT_REASONS = {
     "userRateLimitExceeded",
     "userRequestsExceedRateLimit",
 }
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
+LEGACY_STATE_SCHEMA_VERSION = 2
 RECOVERABLE_STATES = {"created", "ready", "testStarting", "testing", "liveStarting", "live"}
 TERMINAL_STATES = {"complete", "revoked"}
 KNOWN_LIFECYCLE_STATES = RECOVERABLE_STATES | TERMINAL_STATES
 INSTANCE_MARKER_PREFIX = "youtube-autoencoder-instance"
 GENERATION_MARKER_PREFIX = "youtube-autoencoder-generation"
+CREATE_FINGERPRINT_WINDOW = dt.timedelta(minutes=15)
 
 
 class YouTubeApiError(RuntimeError):
@@ -448,7 +450,6 @@ def create_stream() -> dict[str, Any]:
     body = {
         "snippet": {
             "title": os.environ.get("YTA_YOUTUBE_STREAM_TITLE", "YouTube AutoEncoder Stream"),
-            "description": "Reusable stream for YouTube AutoEncoder.",
         },
         "cdn": {
             "ingestionType": "rtmp",
@@ -500,15 +501,20 @@ def generation_marker(generation: str) -> str:
     return f"[{GENERATION_MARKER_PREFIX}:{generation}]"
 
 
-def broadcast_description(instance: str, generation: str) -> str:
-    return "\n".join(
-        [
-            "Managed by YouTube AutoEncoder.",
-            "",
-            instance_marker(instance),
-            generation_marker(generation),
-        ]
-    )
+def parse_rfc3339(value: str, field: str) -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ReconciliationError(f"invalid {field} timestamp: {value or '<empty>'}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.astimezone(dt.UTC)
+
+
+def planned_broadcast_start(now: dt.datetime | None = None) -> str:
+    current = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    planned = current.replace(microsecond=0) + dt.timedelta(minutes=1)
+    return planned.isoformat().replace("+00:00", "Z")
 
 
 def has_marker(broadcast: dict[str, Any], marker: str) -> bool:
@@ -537,6 +543,69 @@ def broadcast_privacy(broadcast: dict[str, Any]) -> str:
 
 def broadcast_bound_stream(broadcast: dict[str, Any]) -> str:
     return str((broadcast.get("contentDetails") or {}).get("boundStreamId") or "")
+
+
+def broadcast_title(broadcast: dict[str, Any]) -> str:
+    return str((broadcast.get("snippet") or {}).get("title") or "")
+
+
+def broadcast_has_create_settings(broadcast: dict[str, Any]) -> bool:
+    details = broadcast.get("contentDetails") or {}
+    monitor = details.get("monitorStream") or {}
+    return (
+        details.get("enableAutoStart") is False
+        and details.get("enableAutoStop") is False
+        and details.get("enableDvr") is True
+        and details.get("recordFromStart") is True
+        and monitor.get("enableMonitorStream") is True
+    )
+
+
+def intent_privacy(state: dict[str, Any]) -> str:
+    return str(state.get("staging_privacy") or state.get("last_known_privacy") or state.get("privacy") or "")
+
+
+def matches_create_intent(broadcast: dict[str, Any], state: dict[str, Any], stream_id: str) -> bool:
+    if broadcast_title(broadcast) != str(state.get("title") or ""):
+        return False
+    lifecycle = broadcast_lifecycle(broadcast)
+    if lifecycle not in RECOVERABLE_STATES:
+        return False
+    if broadcast_privacy(broadcast) != intent_privacy(state):
+        return False
+    bound_stream = broadcast_bound_stream(broadcast)
+    if bound_stream and bound_stream != stream_id:
+        return False
+    if not broadcast_has_create_settings(broadcast):
+        return False
+
+    snippet = broadcast.get("snippet") or {}
+    scheduled = str(snippet.get("scheduledStartTime") or "")
+    intended_scheduled = str(state.get("scheduled_start_time") or "")
+    published = str(snippet.get("publishedAt") or "")
+    intended_at = str(state.get("create_intent_at") or "")
+    if not all((scheduled, intended_scheduled, published, intended_at)):
+        return False
+    try:
+        scheduled_at = parse_rfc3339(scheduled, "scheduledStartTime")
+        intended_scheduled_at = parse_rfc3339(intended_scheduled, "scheduled_start_time")
+        published_at = parse_rfc3339(published, "publishedAt")
+        create_intent_at = parse_rfc3339(intended_at, "create_intent_at")
+    except ReconciliationError:
+        return False
+    if int(scheduled_at.timestamp()) != int(intended_scheduled_at.timestamp()):
+        return False
+    return abs(published_at - create_intent_at) <= CREATE_FINGERPRINT_WINDOW
+
+
+def choose_intent_candidate(
+    broadcasts: list[dict[str, Any]], *, state: dict[str, Any], stream_id: str
+) -> dict[str, Any] | None:
+    matches = [broadcast for broadcast in broadcasts if matches_create_intent(broadcast, state, stream_id)]
+    if len(matches) > 1:
+        ids = ",".join(sorted(str(item.get("id") or "") for item in matches))
+        raise ReconciliationError(f"multiple broadcasts match the uncertain create intent: {ids}")
+    return matches[0] if matches else None
 
 
 def broadcast_by_id(broadcast_id: str) -> dict[str, Any] | None:
@@ -619,6 +688,9 @@ def lifecycle_state(
     broadcast_id = str((broadcast or {}).get("id") or "")
     lifecycle = broadcast_lifecycle(broadcast or {})
     privacy = broadcast_privacy(broadcast or {}) or staging_privacy
+    snippet = (broadcast or {}).get("snippet") or {}
+    scheduled_start_time = str(previous.get("scheduled_start_time") or snippet.get("scheduledStartTime") or "")
+    create_intent_at = str(previous.get("create_intent_at") or snippet.get("publishedAt") or "")
     state = {
         "schema_version": STATE_SCHEMA_VERSION,
         "instance_id": instance,
@@ -628,6 +700,7 @@ def lifecycle_state(
         "pending_action": pending_action,
         "last_known_lifecycle": lifecycle or None,
         "last_known_privacy": privacy,
+        "staging_privacy": staging_privacy,
         "title": title,
         "updated_at": utc_now(),
         "last_stream_id": stream_id,
@@ -635,24 +708,39 @@ def lifecycle_state(
         "lifecycle": lifecycle or None,
         "privacy": privacy,
     }
+    if scheduled_start_time:
+        state["scheduled_start_time"] = scheduled_start_time
+    if create_intent_at:
+        state["create_intent_at"] = create_intent_at
     for key in ("retry_class", "retry_attempt", "retry_not_before"):
         if key in previous:
             state[key] = previous[key]
     return state
 
 
-def validate_candidate(broadcast: dict[str, Any], *, instance: str, generation: str | None, stream_id: str) -> None:
+def validate_candidate(broadcast: dict[str, Any], *, stream_id: str, expected_id: str | None = None) -> None:
+    broadcast_id = str(broadcast.get("id") or "")
+    if not broadcast_id:
+        raise ReconciliationError("YouTube broadcast candidate has no id")
+    if expected_id and broadcast_id != expected_id:
+        raise ReconciliationError("YouTube returned an unexpected cached broadcast id")
     lifecycle = broadcast_lifecycle(broadcast)
     if lifecycle not in KNOWN_LIFECYCLE_STATES:
         raise ReconciliationError(f"unknown YouTube broadcast lifecycle: {lifecycle or '<empty>'}")
-    if not has_marker(broadcast, instance_marker(instance)):
-        raise ReconciliationError("cached broadcast did not match this encoder instance")
-    candidate_generation = broadcast_generation(broadcast)
-    if generation and candidate_generation != generation:
-        raise ReconciliationError("cached broadcast did not match the persisted generation")
     bound_stream = broadcast_bound_stream(broadcast)
     if bound_stream and bound_stream != stream_id:
         raise ReconciliationError(f"managed broadcast is bound to a different stream: {bound_stream}")
+
+
+def validate_legacy_candidate(
+    broadcast: dict[str, Any], *, instance: str, generation: str | None, stream_id: str
+) -> None:
+    validate_candidate(broadcast, stream_id=stream_id)
+    if not has_marker(broadcast, instance_marker(instance)):
+        raise ReconciliationError("legacy broadcast did not match this encoder instance")
+    candidate_generation = broadcast_generation(broadcast)
+    if generation and candidate_generation != generation:
+        raise ReconciliationError("legacy broadcast did not match the persisted generation")
 
 
 def choose_candidate(
@@ -666,16 +754,39 @@ def choose_candidate(
         marker = generation_marker(generation)
         candidates = [broadcast for broadcast in broadcasts if has_marker(broadcast, marker)]
         if broadcasts and not candidates:
-            candidate_generation = str((broadcasts[0].get("snippet") or {}).get("description") or "")
+            candidate_ids = ",".join(sorted(str(item.get("id") or "") for item in broadcasts))
             raise ReconciliationError(
-                "managed broadcast generation conflicts with the persisted write-ahead generation: "
-                f"{candidate_generation}"
+                f"managed broadcast generation conflicts with the persisted write-ahead generation: {candidate_ids}"
             )
     if not candidates:
         return None
     candidate = candidates[0]
-    validate_candidate(candidate, instance=instance, generation=generation, stream_id=stream_id)
+    validate_legacy_candidate(candidate, instance=instance, generation=generation, stream_id=stream_id)
     return candidate
+
+
+def validate_inventory(
+    broadcasts: list[dict[str, Any]],
+    *,
+    stream_id: str,
+    title: str,
+    owned_id: str = "",
+    block_same_title: bool,
+) -> None:
+    other = [broadcast for broadcast in broadcasts if str(broadcast.get("id") or "") != owned_id]
+    bound_conflicts = [broadcast for broadcast in other if broadcast_bound_stream(broadcast) == stream_id]
+    if bound_conflicts:
+        ids = ",".join(sorted(str(item.get("id") or "") for item in bound_conflicts))
+        raise ReconciliationError(f"unmarked or unowned broadcast is bound to the reusable stream: {ids}")
+    if block_same_title:
+        title_conflicts = [
+            broadcast
+            for broadcast in other
+            if not broadcast_bound_stream(broadcast) and broadcast_title(broadcast) == title
+        ]
+        if title_conflicts:
+            ids = ",".join(sorted(str(item.get("id") or "") for item in title_conflicts))
+            raise ReconciliationError(f"unowned unbound broadcast uses the requested title: {ids}")
 
 
 def reconcile_broadcast(
@@ -690,51 +801,102 @@ def reconcile_broadcast(
         if offline_create and staging_privacy != "unlisted":
             raise ReconciliationError("offline broadcast staging must use unlisted privacy")
         instance = instance_id()
-        state = read_state()
+        stored_state = read_state()
+        stored_schema = stored_state.get("schema_version")
         if (
-            state.get("schema_version") != STATE_SCHEMA_VERSION
-            or state.get("instance_id") != instance
-            or state.get("stream_id") != stream_id
+            stored_schema not in {LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION}
+            or stored_state.get("instance_id") != instance
+            or stored_state.get("stream_id") != stream_id
         ):
             state = {}
+        else:
+            state = stored_state
 
         generation = str(state.get("generation_id") or "") or None
         broadcast: dict[str, Any] | None = None
-        offline_candidates = list_offline_managed_broadcasts(instance, stream_id) if offline_create else None
+        inventory_cache = list_recoverable_broadcasts() if offline_create else None
+
+        def inventory() -> list[dict[str, Any]]:
+            nonlocal inventory_cache
+            if inventory_cache is None:
+                inventory_cache = list_recoverable_broadcasts()
+            return inventory_cache
+
         cached_id = str(state.get("broadcast_id") or state.get("last_broadcast_id") or "")
         if cached_id:
             cached = broadcast_by_id(cached_id)
             if cached is not None:
-                validate_candidate(cached, instance=instance, generation=generation, stream_id=stream_id)
+                validate_candidate(cached, stream_id=stream_id, expected_id=cached_id)
                 if broadcast_lifecycle(cached) in RECOVERABLE_STATES:
                     broadcast = cached
+                    if offline_create:
+                        validate_inventory(
+                            inventory(),
+                            stream_id=stream_id,
+                            title=title,
+                            owned_id=cached_id,
+                            block_same_title=False,
+                        )
                 elif broadcast_lifecycle(cached) in TERMINAL_STATES:
                     state = {}
                     generation = None
+            else:
+                state = {}
+                generation = None
 
-        def candidates() -> list[dict[str, Any]]:
-            nonlocal offline_candidates
-            if offline_create:
-                if offline_candidates is not None:
-                    result = offline_candidates
-                    offline_candidates = None
-                    return result
-                return list_offline_managed_broadcasts(instance, stream_id)
-            return list_managed_broadcasts(instance)
+        state_schema = state.get("schema_version")
+        pending_action = str(state.get("pending_action") or "")
+        if broadcast is None and state_schema == STATE_SCHEMA_VERSION and pending_action == "verify_create":
+            broadcast = choose_intent_candidate(inventory(), state=state, stream_id=stream_id)
+            if broadcast is None:
+                raise ReconciliationError(
+                    "broadcast create outcome is uncertain; no exact remote candidate exists and another insert is disabled"
+                )
+            validate_candidate(broadcast, stream_id=stream_id)
+            validate_inventory(
+                inventory(),
+                stream_id=stream_id,
+                title=title,
+                owned_id=str(broadcast["id"]),
+                block_same_title=False,
+            )
 
-        if broadcast is None:
-            managed = candidates()
+        if broadcast is None and state_schema == STATE_SCHEMA_VERSION and pending_action not in {"", "create"}:
+            raise ReconciliationError(f"unsupported pending lifecycle action: {pending_action}")
+        if broadcast is None and state_schema == STATE_SCHEMA_VERSION and not pending_action:
+            raise ReconciliationError("managed lifecycle state has no broadcast id or pending create action")
+
+        if broadcast is None and state_schema in {None, LEGACY_STATE_SCHEMA_VERSION}:
+            legacy = [candidate for candidate in inventory() if has_marker(candidate, instance_marker(instance))]
             broadcast = choose_candidate(
-                managed,
+                legacy,
                 instance=instance,
                 generation=generation,
                 stream_id=stream_id,
             )
+            if broadcast is not None:
+                validate_inventory(
+                    inventory(),
+                    stream_id=stream_id,
+                    title=title,
+                    owned_id=str(broadcast["id"]),
+                    block_same_title=False,
+                )
+            elif state_schema == LEGACY_STATE_SCHEMA_VERSION and (generation or pending_action):
+                raise ReconciliationError(
+                    "legacy broadcast create outcome is uncertain; no exact marked candidate exists"
+                )
 
         if broadcast is None and not allow_create:
             raise ReconciliationError("no recoverable managed broadcast exists and creation is disabled")
 
         if broadcast is None:
+            validate_inventory(
+                inventory(),
+                stream_id=stream_id,
+                title=title,
+                block_same_title=True,
+            )
             if not offline_create:
                 stream = stream_by_id(stream_id)
                 stream_status_value = str((stream.get("status") or {}).get("streamStatus") or "")
@@ -745,56 +907,64 @@ def reconcile_broadcast(
                     )
             if generation is None:
                 generation = str(uuid.uuid4())
-                state = lifecycle_state(
-                    state,
-                    instance=instance,
-                    generation=generation,
-                    stream_id=stream_id,
-                    broadcast=None,
-                    pending_action="create",
-                    title=title,
-                    staging_privacy=staging_privacy,
-                )
-                write_state(state)
 
-            exact = choose_candidate(
-                candidates(),
+            state = lifecycle_state(
+                state,
                 instance=instance,
                 generation=generation,
                 stream_id=stream_id,
+                broadcast=None,
+                pending_action="create",
+                title=title,
+                staging_privacy=staging_privacy,
             )
-            if exact is not None:
-                broadcast = exact
-            else:
-                if not offline_create:
-                    stream = stream_by_id(stream_id)
-                    stream_status_value = str((stream.get("status") or {}).get("streamStatus") or "")
-                    if stream_status_value != "active":
-                        raise ReconciliationError(
-                            "YouTube ingest stopped before broadcast creation; "
-                            f"got {stream_status_value or 'unknown'}"
-                        )
+            state["scheduled_start_time"] = planned_broadcast_start()
+            state["create_intent_at"] = utc_now()
+            write_state(state)
+            state["pending_action"] = "verify_create"
+            state["updated_at"] = utc_now()
+            write_state(state)
+
+            if not offline_create:
+                stream = stream_by_id(stream_id)
+                stream_status_value = str((stream.get("status") or {}).get("streamStatus") or "")
+                if stream_status_value != "active":
+                    raise ReconciliationError(
+                        f"YouTube ingest stopped before broadcast creation; got {stream_status_value or 'unknown'}"
+                    )
+            try:
                 broadcast = create_broadcast(
                     title,
                     staging_privacy,
-                    description=broadcast_description(instance, generation),
+                    scheduled_start_time=str(state["scheduled_start_time"]),
                 )
-                validate_candidate(broadcast, instance=instance, generation=generation, stream_id=stream_id)
-                state = lifecycle_state(
-                    state,
-                    instance=instance,
-                    generation=generation,
-                    stream_id=stream_id,
-                    broadcast=broadcast,
-                    pending_action="bind",
-                    title=title,
-                    staging_privacy=staging_privacy,
-                )
-                write_state(state)
+            except YouTubeApiError as exc:
+                if exc.status is not None and 400 <= exc.status < 500 and exc.status != 408:
+                    state["pending_action"] = "create"
+                    state["updated_at"] = utc_now()
+                    write_state(state)
+                raise
+            if not matches_create_intent(broadcast, state, stream_id):
+                raise ReconciliationError("broadcast insert response did not match the durable create intent")
+            validate_candidate(broadcast, stream_id=stream_id)
+            state = lifecycle_state(
+                state,
+                instance=instance,
+                generation=generation,
+                stream_id=stream_id,
+                broadcast=broadcast,
+                pending_action="bind",
+                title=title,
+                staging_privacy=staging_privacy,
+            )
+            write_state(state)
 
-        validate_candidate(broadcast, instance=instance, generation=generation, stream_id=stream_id)
+        validate_candidate(broadcast, stream_id=stream_id)
         if generation is None:
-            generation = broadcast_generation(broadcast)
+            if has_marker(broadcast, instance_marker(instance)):
+                generation = broadcast_generation(broadcast)
+            else:
+                generation = str(uuid.uuid4())
         if broadcast_bound_stream(broadcast) != stream_id:
             state = lifecycle_state(
                 state,
@@ -808,7 +978,7 @@ def reconcile_broadcast(
             )
             write_state(state)
             broadcast = bind_broadcast(str(broadcast["id"]), stream_id)
-            validate_candidate(broadcast, instance=instance, generation=generation, stream_id=stream_id)
+            validate_candidate(broadcast, stream_id=stream_id, expected_id=str(state["broadcast_id"]))
 
         state = lifecycle_state(
             state,
@@ -855,13 +1025,11 @@ def clear_retry_state() -> dict[str, Any]:
         return state
 
 
-def create_broadcast(title: str, privacy: str, description: str | None = None) -> dict[str, Any]:
-    start_time = (dt.datetime.now(dt.UTC) + dt.timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+def create_broadcast(title: str, privacy: str, *, scheduled_start_time: str) -> dict[str, Any]:
     body = {
         "snippet": {
             "title": title,
-            "description": description or "Started by YouTube AutoEncoder.",
-            "scheduledStartTime": start_time,
+            "scheduledStartTime": scheduled_start_time,
         },
         "contentDetails": {
             "enableDvr": True,

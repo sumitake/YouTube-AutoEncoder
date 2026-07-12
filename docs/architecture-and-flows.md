@@ -35,7 +35,7 @@ flowchart TB
         direction LR
         Ingest["Reusable liveStream ingest"]
         Api["YouTube Data API v3"]
-        Broadcast["One marked liveBroadcast and watch page"]
+        Broadcast["One owned liveBroadcast and watch page"]
     end
 
     Systemd -->|"start and restart"| Supervisor
@@ -74,8 +74,8 @@ stateDiagram-v2
     state "Startup or restart" as RecoveryStartup
     state "Managed stream generation" as RecoveryGeneration {
         state "Probe camera source" as RecoveryProbe
-        state "Reconcile exact ownership markers" as RecoveryReconcile
-        state "Create and bind unlisted generation" as RecoveryCreate
+        state "Validate exact cached ID and conflicts" as RecoveryReconcile
+        state "Persist intent, insert without description, and bind" as RecoveryCreate
         state "Resume one nonterminal event" as RecoveryManaged
         state "Start FFmpeg and require active ingest" as RecoveryMedia
         state "Testing, live, and publication gates" as RecoveryGates
@@ -84,7 +84,7 @@ stateDiagram-v2
 
         [*] --> RecoveryProbe
         RecoveryProbe --> RecoveryReconcile : source available
-        RecoveryReconcile --> RecoveryManaged : one marked nonterminal event
+        RecoveryReconcile --> RecoveryManaged : one owned nonterminal event
         RecoveryReconcile --> RecoveryCreate : none, terminal, or missing
         RecoveryCreate --> RecoveryManaged : insert and bind verified
         RecoveryManaged --> RecoveryMedia : ownership and binding durable
@@ -100,7 +100,10 @@ stateDiagram-v2
     RecoveryBackoff --> RecoveryStartup : deadline expires or host restarts
     RecoveryStartup --> RecoveryGeneration : no active deadline
     RecoveryGeneration --> RecoveryBackoff : recoverable failure, preserve ownership
+    RecoveryCreate --> RecoveryBackoff : insert outcome uncertain, never reinsert
 ```
+
+The helper never sets or updates YouTube descriptions. Schema-v3 state stores the exact broadcast ID and a write-ahead create fingerprint. A lost insert response enters `verify_create`; recovery may adopt exactly one normalized remote match, but zero or multiple matches stay blocked under durable ambiguous backoff. Legacy description markers are read only for one-way schema-v2 migration.
 
 Return to [Recovery Behavior](../README.md#recovery-behavior).
 

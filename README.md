@@ -12,9 +12,9 @@ The project runs FFmpeg under systemd, optionally reuses OBS profile data for ca
 
 YouTube AutoEncoder turns a dedicated Linux device into an unattended YouTube streaming encoder. The core service performs three jobs:
 
-- Validate the camera source, stage one marked unlisted broadcast, and require healthy media before lifecycle transitions.
+- Validate the camera source, stage one description-neutral unlisted broadcast, and require healthy media before lifecycle transitions.
 - Push the stream with FFmpeg using low-CPU video copy mode or explicit transcode mode.
-- Reconcile one marked YouTube broadcast, stage it unlisted, and publish it only after live health is confirmed.
+- Reconcile one exact cached YouTube broadcast ID, stage it unlisted, and publish it only after live health is confirmed.
 
 The intended outcome is an appliance-like encoder that can be deployed on a Raspberry Pi, left headless, and managed remotely through normal Linux tools. Camera, encoder, service, network, and host failures retain the same nonterminal broadcast and watch URL. A replacement is allowed only after YouTube confirms that the previous event is terminal or missing.
 
@@ -61,7 +61,7 @@ Important files:
 - `youtube-autoencoder.env`: private service configuration.
 - `google-oauth-client.json`: Google OAuth client configuration.
 - `youtube-token.json`: OAuth access and refresh token cache.
-- `youtube-live-state.json`: versioned, non-secret lifecycle cache containing instance, generation, stream, broadcast, privacy, lifecycle, and retry metadata.
+- `youtube-live-state.json`: versioned, non-secret lifecycle cache containing exact resource IDs, local create intent, privacy, lifecycle, and retry metadata.
 - `youtube-live-state.lock`: serialized mutation lock for create, bind, transition, privacy, and explicit completion operations.
 - `supervisor.lock`: process-lifetime lock preventing two encoder supervisors from running concurrently.
 
@@ -91,13 +91,13 @@ OBS compatibility mode can also read and update:
 2. The supervisor acquires its single-instance lock and honors any persisted recovery deadline.
 3. The source and ingest URLs are resolved from direct settings or OBS compatibility files.
 4. FFprobe checks the RTSP source; unavailable sources use bounded source backoff without a broadcast insert.
-5. Before ingest starts, the helper lists recoverable events, blocks any unmarked event bound to the reusable stream, and reuses or stages exactly one marked unlisted broadcast.
-6. The helper durably stores the broadcast ID and verifies binding before the supervisor starts FFmpeg.
+5. Before ingest starts, the helper validates the exact cached broadcast ID, checks the reusable stream for ownership conflicts, and reuses or stages exactly one unlisted broadcast.
+6. A new event uses a durable schema-v3 create intent, omits the YouTube description field, stores the returned broadcast ID, and verifies binding before the supervisor starts FFmpeg.
 7. FFmpeg emits machine-readable progress and pushes to the reusable YouTube stream.
 8. One-shot API checks wait for both recent media progress and active YouTube ingest.
 9. Before and after each `testing` or `live` transition, the supervisor rechecks FFmpeg progress and YouTube ingest.
 10. Two consecutive healthy `live` observations are required before visibility changes to `YTA_YOUTUBE_LIVE_PRIVACY`.
-11. The helper verifies the privacy readback, clears recovery state, and the supervisor stops nonessential API polling.
+11. The helper verifies the privacy readback, clears retry metadata, and the supervisor stops nonessential API polling.
 12. FFmpeg remains supervised until source loss, process failure, service stop, rotation, or host interruption; failures persist a class-specific cooldown and reuse the same broadcast without completing it.
 
 ### Optional Telemetry Loop
@@ -127,7 +127,9 @@ See the [recovery state machine](docs/architecture-and-flows.md#recovery-state-m
 | YouTube ingest does not become active | The single staged unlisted event is retained; no transition or publication occurs. |
 | YouTube API rate limit or outage before FFmpeg starts | Startup fails closed, no ingest begins, and the retry class and deadline persist. |
 | YouTube API rate limit or outage after validated public ingest is active | The already-running public stream can continue without control-plane mutation. |
-| Unmarked event is bound to the reusable stream | Reconciliation fails closed before FFmpeg starts, preventing an unintended legacy auto-start. |
+| Unowned event is bound to the reusable stream | Reconciliation fails closed before FFmpeg starts, preventing an unintended legacy auto-start. |
+| Insert response is lost or ambiguous | The durable `verify_create` intent polls under ambiguous backoff and never issues another insert automatically. |
+| Lifecycle state is missing or corrupt | Legacy markers may be read once for migration; otherwise conflicting same-stream or same-title resources block creation until an operator reconciles ownership. |
 | Ambiguous or unknown remote state | Reconciliation fails closed and creates nothing until the ambiguity is resolved. |
 | OAuth access token expires | API helper refreshes from the stored refresh token. |
 | Previous broadcast is `complete`, `revoked`, or confirmed missing | One new unlisted generation may be staged after the source probe passes. |
@@ -141,7 +143,7 @@ Recovery deadlines survive service and host restarts. Exponential backoff uses t
 | Quota | 15 minutes | 6 hours | `userRequestsExceedRateLimit`, quota errors, HTTP 429. |
 | Ambiguous | 5 minutes | 1 hour | Multiple managed candidates, unknown lifecycle, conflicting state. |
 
-Every managed event description contains exact instance and generation markers. A write-ahead generation is persisted before insert, so a lost API response is reconciled by marker before another insert can occur. Title matching is never used as proof of ownership.
+The project never sets or updates YouTube `liveBroadcast` or `liveStream` descriptions. Normal recovery validates the exact broadcast ID in the private schema-v3 state file. Before a new insert, the helper persists the required title, scheduled start, privacy, creation window, and stream relationship; if the insert outcome is ambiguous, those fields may identify exactly one remote candidate, but they can never authorize another automatic insert. Legacy description markers are read only during one-way migration from schema v2.
 
 ### Test Pattern Flow
 
@@ -216,7 +218,7 @@ The service is configured entirely through environment variables. The most impor
 | `YTA_OBS_SOURCE_NAME` | Optional OBS VLC source name selector. |
 | `YTA_MODE` | `copy` for low CPU video copy, or `transcode` for re-encoding. |
 | `YTA_YOUTUBE_LIFECYCLE` | Enable or disable API-managed broadcast lifecycle. |
-| `YTA_INSTANCE_ID` | Stable deployment identity used in exact broadcast ownership markers. |
+| `YTA_INSTANCE_ID` | Stable deployment identity stored in private lifecycle state and used to scope legacy migration. |
 | `YTA_YOUTUBE_STAGING_PRIVACY` | Visibility for a new event before health confirmation; use `unlisted`. |
 | `YTA_YOUTUBE_LIVE_PRIVACY` | Visibility applied after two healthy live observations; use `public` for a public channel stream. |
 | `YTA_YOUTUBE_TITLE_PREFIX` | Prefix used for generated broadcast titles. |
@@ -497,12 +499,14 @@ Each eligible collection performs one [`videos.list`](https://developers.google.
 - YouTube Live must already be enabled on the channel. New or restricted channels may not be allowed to stream immediately.
 - The YouTube Data API flow requires OAuth user consent. A simple API key is not enough for creating, binding, or transitioning live broadcasts.
 - Google OAuth app restrictions can block authorization if the app is limited to an organization that does not include the streaming account.
-- A source that passes its probe and then fails can leave one marked unlisted upcoming event. Recovery reuses that event; it does not create another generation.
+- A source that passes its probe and then fails can leave one unlisted upcoming event. Recovery reuses its exact cached ID; it does not create another generation.
 - YouTube API quota, API outages, or account policy restrictions can prevent lifecycle operations even when FFmpeg is healthy.
 - Optional telemetry consumes Data API quota independently of lifecycle operations; keep exactly one timer mode active and account for its maximum 288 units per day.
 - Telemetry statistics are aggregate snapshots. `concurrent_viewers` and other fields may be `null` when YouTube omits them, and the collector intentionally does not backfill YouTube Analytics or Reporting data.
-- Recovery reuses one exactly marked nonterminal broadcast. A new generation is permitted only after the previous managed event is `complete`, `revoked`, or confirmed missing.
-- Broadcasts created by older releases do not contain ownership markers. They are not adopted or deleted automatically; inventory and clean up legacy duplicates separately after verifying their lifecycle and watch URLs.
+- Recovery reuses one exact cached nonterminal broadcast ID. A new generation is permitted only after the previous managed event is `complete`, `revoked`, or confirmed missing.
+- Releases before schema v3 wrote instance and generation markers into the broadcast description. Current code can read those markers only to migrate ownership; it never writes or clears descriptions.
+- Do not delete or reset a `verify_create` state to force progress. When YouTube cannot prove whether an insert succeeded, operator reconciliation is required to avoid creating a duplicate event.
+- Total loss of marker-free lifecycle state intentionally fails closed when a recoverable broadcast uses the reusable stream or requested title. Back up the private state file with the host configuration.
 - A live broadcast cannot return to a scheduled or testing state. After an event reaches `live`, recovery preserves it until an operator explicitly completes it.
 - A public event intentionally remains public during a camera or host outage, so its existing watch page may temporarily show unavailable video while the encoder recovers.
 - `YTA_MODE=copy` is lowest CPU, but it only works when the camera video stream is compatible with YouTube ingest expectations. H.265 or unusual camera output usually requires `YTA_MODE=transcode`.
@@ -517,10 +521,10 @@ Each eligible collection performs one [`videos.list`](https://developers.google.
 
 Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full history.
 
-### 2026-07-11 - Live Visibility Publication Fix
+### 2026-07-11 - Description-Neutral Lifecycle Identity
 
-- Corrected the privacy-only YouTube update payload so a healthy live broadcast can be promoted from unlisted to the configured final visibility without an HTTP 400 `unexpectedPart` failure.
-- Publication still preserves the existing broadcast and verifies the remote privacy readback before declaring the stream stable.
+- New YouTube stream and broadcast inserts omit the description field, and normal lifecycle recovery never updates descriptions.
+- Schema-v3 exact-ID state and a durable create fingerprint retain duplicate-safe recovery; legacy markers are read only for one-way migration.
 
 ## Repository Layout
 
