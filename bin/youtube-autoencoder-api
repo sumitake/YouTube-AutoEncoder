@@ -840,11 +840,9 @@ def reconcile_broadcast(
                 elif broadcast_lifecycle(cached) in TERMINAL_STATES:
                     state = {}
                     generation = None
-                    cached_id = ""
             else:
                 state = {}
                 generation = None
-                cached_id = ""
 
         state_schema = state.get("schema_version")
         pending_action = str(state.get("pending_action") or "")
