@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
@@ -33,6 +34,11 @@ OBS_SERVICE_FILE = pathlib.Path(os.environ.get("YTA_OBS_SERVICE_FILE", OBS_PROFI
 OBS_SCENE_FILE = pathlib.Path(
     os.environ.get("YTA_OBS_SCENE_FILE", HOME / ".config/obs-studio/basic/scenes/Untitled.json")
 ).expanduser()
+CONFIG_DIR = pathlib.Path(os.environ.get("YTA_CONFIG_DIR", HOME / ".config/youtube-autoencoder")).expanduser()
+OAUTH_TOKEN_FILE = pathlib.Path(
+    os.environ.get("YTA_YOUTUBE_TOKEN_FILE", CONFIG_DIR / "youtube-token.json")
+).expanduser()
+OAUTH_TOKEN_MAX_BYTES = 1024 * 1024
 
 child: subprocess.Popen[Any] | None = None
 stopping = False
@@ -83,6 +89,7 @@ class ApiCommandError(RuntimeError):
         self.http_status = self.payload.get("http_status")
         self.reasons = tuple(str(reason) for reason in self.payload.get("reasons") or [])
         self.retry_class = str(self.payload.get("retry_class") or "fatal")
+        self.token_updated = self.payload.get("token_updated") is True
         self.public_fallback_allowed = self.payload.get("public_fallback_allowed") is not False
         retry_after = self.payload.get("retry_after")
         try:
@@ -199,7 +206,63 @@ def lifecycle_action(lifecycle: str) -> str:
 
 
 def classify_api_error(error: ApiCommandError) -> str:
+    if error.retry_class == "oauth":
+        return "oauth"
     return error.retry_class if error.retry_class in RETRY_LIMITS else "ambiguous"
+
+
+def oauth_token_fingerprint() -> tuple[Any, ...]:
+    try:
+        token_stat = OAUTH_TOKEN_FILE.stat()
+    except FileNotFoundError:
+        return ("missing",)
+    except OSError as exc:
+        return ("unreadable", exc.errno)
+
+    metadata = (
+        token_stat.st_dev,
+        token_stat.st_ino,
+        token_stat.st_mode & 0o7777,
+        token_stat.st_uid,
+        token_stat.st_gid,
+        token_stat.st_size,
+        token_stat.st_mtime_ns,
+    )
+    if token_stat.st_size > OAUTH_TOKEN_MAX_BYTES:
+        return ("oversized", *metadata)
+    try:
+        with OAUTH_TOKEN_FILE.open("rb") as handle:
+            raw = handle.read(OAUTH_TOKEN_MAX_BYTES + 1)
+    except OSError as exc:
+        return ("unreadable", *metadata, exc.errno)
+    if len(raw) > OAUTH_TOKEN_MAX_BYTES:
+        return ("oversized", *metadata)
+    return ("readable", *metadata, hashlib.sha256(raw).hexdigest())
+
+
+def oauth_blocked_poll_interval() -> float:
+    return max(0.1, float(env("YTA_OAUTH_BLOCKED_POLL_SEC", "5")))
+
+
+def oauth_wait_baseline(error: ApiCommandError, pre_attempt: tuple[Any, ...]) -> tuple[Any, ...]:
+    return oauth_token_fingerprint() if error.token_updated else pre_attempt
+
+
+def wait_for_oauth_token_change(
+    baseline: tuple[Any, ...],
+    *,
+    runtime: StreamRuntime | None = None,
+) -> bool:
+    while not stopping:
+        if oauth_token_fingerprint() != baseline:
+            log("OAuth credential change detected; resuming YouTube API recovery")
+            return True
+        duration = oauth_blocked_poll_interval()
+        if runtime is None:
+            sleep_interruptibly(duration)
+        else:
+            wait_with_runtime(runtime, duration)
+    return False
 
 
 def retry_delay(
@@ -906,32 +969,44 @@ def revalidate_public_state(runtime: StreamRuntime, state: dict[str, Any]) -> di
 
 
 def manage_with_public_fallback(runtime: StreamRuntime, cached_state: dict[str, Any]) -> dict[str, Any]:
-    try:
-        return manage_youtube_lifecycle(runtime, prepared_state=cached_state)
-    except ApiCommandError as error:
-        if not verified_public_state(cached_state) or not error.public_fallback_allowed:
-            raise
-        ensure_encoder_running(runtime)
-        retry_class = classify_api_error(error)
-        attempt = retry_attempt(cached_state, retry_class)
-        delay = retry_delay(retry_class, attempt=attempt, retry_after=error.retry_after)
-        not_before = retry_not_before(delay)
+    while True:
+        token_fingerprint = oauth_token_fingerprint()
         try:
-            api_command_while_streaming(
-                ["set-retry", retry_class, str(attempt), not_before],
-                runtime,
-                timeout=30,
+            return manage_youtube_lifecycle(runtime, prepared_state=cached_state)
+        except ApiCommandError as error:
+            if not verified_public_state(cached_state) or not error.public_fallback_allowed:
+                raise
+            ensure_encoder_running(runtime)
+            retry_class = classify_api_error(error)
+            if retry_class == "oauth":
+                log(
+                    "YouTube OAuth authorization required; preserving verified public stream and waiting for "
+                    "credential change. Run: youtube-autoencoder-api authorize. "
+                    f"error={redact_text(str(error))}"
+                )
+                wait_baseline = oauth_wait_baseline(error, token_fingerprint)
+                if not wait_for_oauth_token_change(wait_baseline, runtime=runtime):
+                    return dict(cached_state)
+                continue
+            attempt = retry_attempt(cached_state, retry_class)
+            delay = retry_delay(retry_class, attempt=attempt, retry_after=error.retry_after)
+            not_before = retry_not_before(delay)
+            try:
+                api_command_while_streaming(
+                    ["set-retry", retry_class, str(attempt), not_before],
+                    runtime,
+                    timeout=30,
+                )
+            except EncoderStopped:
+                raise
+            except Exception as persist_error:  # noqa: BLE001
+                log(f"could not persist public-stream API cooldown: {redact_text(str(persist_error))}")
+            ensure_encoder_running(runtime)
+            log(
+                "YouTube API unavailable; preserving verified public stream without mutation "
+                f"class={retry_class} attempt={attempt} retry_not_before={not_before}"
             )
-        except EncoderStopped:
-            raise
-        except Exception as persist_error:  # noqa: BLE001
-            log(f"could not persist public-stream API cooldown: {redact_text(str(persist_error))}")
-        ensure_encoder_running(runtime)
-        log(
-            "YouTube API unavailable; preserving verified public stream without mutation "
-            f"class={retry_class} attempt={attempt} retry_not_before={not_before}"
-        )
-        return dict(cached_state)
+            return dict(cached_state)
 
 
 @contextlib.contextmanager
@@ -1082,6 +1157,7 @@ def supervisor_loop() -> int:
             sleep_interruptibly(cooldown)
             continue
         try:
+            token_fingerprint = oauth_token_fingerprint()
             rc = run_once(cached_state=state)
             if stopping:
                 break
@@ -1089,6 +1165,14 @@ def supervisor_loop() -> int:
         except Exception as exc:  # noqa: BLE001
             if stopping:
                 break
+            if isinstance(exc, ApiCommandError) and classify_api_error(exc) == "oauth":
+                log(
+                    "YouTube OAuth authorization required; pausing API recovery until the credential changes. "
+                    "Run: youtube-autoencoder-api authorize. "
+                    f"error={redact_text(str(exc))}"
+                )
+                wait_for_oauth_token_change(oauth_wait_baseline(exc, token_fingerprint))
+                continue
             retry_class = failure_retry_class(exc)
             try:
                 state = read_recovery_state()

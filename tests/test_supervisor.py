@@ -518,6 +518,86 @@ def test_classify_api_error_preserves_structured_retry_class(load_script):
     assert supervisor.classify_api_error(error) == "quota"
 
 
+def test_classify_api_error_preserves_oauth_block(load_script):
+    supervisor = load_script("youtube-autoencoder", "yta_classify_oauth")
+    error = supervisor.ApiCommandError(
+        returncode=78,
+        payload={"message": "Token expired or revoked", "retry_class": "oauth"},
+    )
+
+    assert supervisor.classify_api_error(error) == "oauth"
+
+
+def test_api_command_error_preserves_token_updated_flag(load_script):
+    supervisor = load_script("youtube-autoencoder", "yta_api_token_updated")
+
+    updated = supervisor.ApiCommandError(
+        returncode=78,
+        payload={"message": "still unauthorized", "retry_class": "oauth", "token_updated": True},
+    )
+    unchanged = supervisor.ApiCommandError(
+        returncode=78,
+        payload={"message": "refresh rejected", "retry_class": "oauth", "token_updated": False},
+    )
+
+    assert updated.token_updated is True
+    assert unchanged.token_updated is False
+
+
+def test_oauth_token_fingerprint_detects_creation_and_same_metadata_content_change(load_script, monkeypatch, tmp_path):
+    supervisor = load_script("youtube-autoencoder", "yta_oauth_fingerprint")
+    token_file = tmp_path / "youtube-token.json"
+    monkeypatch.setattr(supervisor, "OAUTH_TOKEN_FILE", token_file)
+
+    missing = supervisor.oauth_token_fingerprint()
+    token_file.write_text('{"refresh_token":"aaaa"}', encoding="utf-8")
+    created = supervisor.oauth_token_fingerprint()
+    original_stat = token_file.stat()
+    token_file.write_text('{"refresh_token":"bbbb"}', encoding="utf-8")
+    token_file.chmod(original_stat.st_mode & 0o777)
+    supervisor.os.utime(token_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    changed = supervisor.oauth_token_fingerprint()
+
+    assert missing != created
+    assert created != changed
+
+
+def test_oauth_token_fingerprint_caps_oversized_files(load_script, monkeypatch, tmp_path):
+    supervisor = load_script("youtube-autoencoder", "yta_oauth_fingerprint_limit")
+    token_file = tmp_path / "youtube-token.json"
+    token_file.write_bytes(b"x" * (supervisor.OAUTH_TOKEN_MAX_BYTES + 1))
+    monkeypatch.setattr(supervisor, "OAUTH_TOKEN_FILE", token_file)
+
+    fingerprint = supervisor.oauth_token_fingerprint()
+
+    assert fingerprint[0] == "oversized"
+
+
+def test_oauth_waiter_retries_immediately_if_token_already_changed(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_oauth_wait_race")
+    monkeypatch.setattr(supervisor, "oauth_token_fingerprint", lambda: ("new",))
+    monkeypatch.setattr(
+        supervisor,
+        "sleep_interruptibly",
+        lambda _duration: pytest.fail("waited after credential already changed"),
+    )
+
+    assert supervisor.wait_for_oauth_token_change(("old",)) is True
+
+
+def test_oauth_waiter_is_interruptible_without_api_calls(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_oauth_wait_interrupt")
+    supervisor.stopping = False
+    monkeypatch.setattr(supervisor, "oauth_token_fingerprint", lambda: ("same",))
+
+    def stop(_duration):
+        supervisor.stopping = True
+
+    monkeypatch.setattr(supervisor, "sleep_interruptibly", stop)
+
+    assert supervisor.wait_for_oauth_token_change(("same",)) is False
+
+
 def test_publication_requires_two_healthy_live_observations(load_script):
     supervisor = load_script("youtube-autoencoder", "yta_public_gate")
     gate = supervisor.PublicationGate(required=2)
@@ -1015,6 +1095,199 @@ def test_cached_public_stream_continues_during_api_quota_failure(load_script, mo
     assert state == cached
     assert calls[0][0][0:4] == ["set-retry", "quota", "1", calls[0][0][3]]
     assert calls[0][1] == 30
+
+
+def test_cached_public_stream_waits_for_oauth_change_then_revalidates_in_place(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_public_oauth_wait")
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+    cached = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "live",
+        "privacy": "public",
+    }
+    failure = supervisor.ApiCommandError(
+        returncode=78,
+        payload={"message": "Token expired or revoked", "retry_class": "oauth"},
+    )
+    attempts = iter([failure, cached])
+    lifecycle_calls = []
+
+    def lifecycle(_runtime, prepared_state=None):
+        lifecycle_calls.append(prepared_state)
+        result = next(attempts)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    wait_calls = []
+    monkeypatch.setattr(supervisor, "manage_youtube_lifecycle", lifecycle)
+    monkeypatch.setattr(supervisor, "oauth_token_fingerprint", lambda: ("old",))
+    monkeypatch.setattr(
+        supervisor,
+        "wait_for_oauth_token_change",
+        lambda baseline, runtime=None: wait_calls.append((baseline, runtime)) or True,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "api_command_while_streaming",
+        lambda *_args, **_kwargs: pytest.fail("OAuth block mutated retry state"),
+    )
+
+    assert supervisor.manage_with_public_fallback(runtime, cached) == cached
+    assert lifecycle_calls == [cached, cached]
+    assert wait_calls == [(("old",), runtime)]
+
+
+def test_cached_public_second_401_waits_on_post_refresh_fingerprint(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_public_oauth_post_refresh_wait")
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+    cached = {
+        "stream_id": "stream-1",
+        "broadcast_id": "broadcast-1",
+        "lifecycle": "live",
+        "privacy": "public",
+    }
+    failure = supervisor.ApiCommandError(
+        returncode=78,
+        payload={
+            "message": "still unauthorized after refresh",
+            "retry_class": "oauth",
+            "token_updated": True,
+        },
+    )
+    attempts = iter([failure, cached])
+    fingerprints = iter([("pre-refresh",), ("post-refresh",), ("next-attempt",)])
+    wait_calls = []
+
+    def lifecycle(_runtime, prepared_state=None):
+        result = next(attempts)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(supervisor, "manage_youtube_lifecycle", lifecycle)
+    monkeypatch.setattr(supervisor, "oauth_token_fingerprint", lambda: next(fingerprints))
+    monkeypatch.setattr(
+        supervisor,
+        "wait_for_oauth_token_change",
+        lambda baseline, runtime=None: wait_calls.append((baseline, runtime)) or True,
+    )
+
+    assert supervisor.manage_with_public_fallback(runtime, cached) == cached
+    assert wait_calls == [(("post-refresh",), runtime)]
+
+
+def test_runtime_oauth_waiter_keeps_ffmpeg_watchdog_active(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_public_oauth_watchdog")
+    runtime = supervisor.StreamRuntime(
+        process=FakeFfmpegProcess(returncode=None),
+        selector=FakeSelector(),
+        watchdog=supervisor.ProgressWatchdog(
+            started_at=supervisor.time.monotonic(),
+            timeout=30.0,
+            last_progress_at=supervisor.time.monotonic(),
+        ),
+    )
+    fingerprints = iter([("same",), ("changed",)])
+    waits = []
+    monkeypatch.setattr(supervisor, "oauth_token_fingerprint", lambda: next(fingerprints))
+    monkeypatch.setattr(supervisor, "wait_with_runtime", lambda seen, duration: waits.append((seen, duration)))
+
+    assert supervisor.wait_for_oauth_token_change(("same",), runtime=runtime) is True
+    assert waits == [(runtime, supervisor.oauth_blocked_poll_interval())]
+
+
+def test_supervisor_oauth_failure_blocks_without_persisting_retry(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_supervisor_oauth_block")
+    supervisor.stopping = False
+    failure = supervisor.ApiCommandError(
+        returncode=78,
+        payload={"message": "Token expired or revoked", "retry_class": "oauth"},
+    )
+    attempts = []
+
+    monkeypatch.setattr(supervisor, "read_recovery_state", lambda: {})
+    monkeypatch.setattr(supervisor, "oauth_token_fingerprint", lambda: ("old",))
+
+    def run_once(cached_state=None):
+        attempts.append(cached_state)
+        raise failure
+
+    def wait(baseline, runtime=None):
+        assert baseline == ("old",)
+        assert runtime is None
+        supervisor.stopping = True
+        return False
+
+    monkeypatch.setattr(supervisor, "run_once", run_once)
+    monkeypatch.setattr(supervisor, "wait_for_oauth_token_change", wait)
+    monkeypatch.setattr(
+        supervisor,
+        "persist_retry",
+        lambda *_args, **_kwargs: pytest.fail("OAuth failure persisted retry state"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "retry_delay",
+        lambda *_args, **_kwargs: pytest.fail("OAuth failure entered retry backoff"),
+    )
+
+    assert supervisor.supervisor_loop() == 0
+    assert attempts == [{}]
+
+
+def test_supervisor_second_401_waits_on_post_refresh_fingerprint(load_script, monkeypatch):
+    supervisor = load_script("youtube-autoencoder", "yta_supervisor_oauth_post_refresh_wait")
+    supervisor.stopping = False
+    failure = supervisor.ApiCommandError(
+        returncode=78,
+        payload={
+            "message": "still unauthorized after refresh",
+            "retry_class": "oauth",
+            "token_updated": True,
+        },
+    )
+    fingerprints = iter([("pre-refresh",), ("post-refresh",)])
+
+    monkeypatch.setattr(supervisor, "read_recovery_state", lambda: {})
+    monkeypatch.setattr(supervisor, "oauth_token_fingerprint", lambda: next(fingerprints))
+    monkeypatch.setattr(
+        supervisor,
+        "run_once",
+        lambda cached_state=None: (_ for _ in ()).throw(failure),
+    )
+
+    def wait(baseline, runtime=None):
+        assert baseline == ("post-refresh",)
+        assert runtime is None
+        supervisor.stopping = True
+        return False
+
+    monkeypatch.setattr(supervisor, "wait_for_oauth_token_change", wait)
+    monkeypatch.setattr(
+        supervisor,
+        "persist_retry",
+        lambda *_args, **_kwargs: pytest.fail("OAuth failure persisted retry state"),
+    )
+
+    assert supervisor.supervisor_loop() == 0
 
 
 def test_invalidated_public_stream_does_not_enter_api_fallback(load_script, monkeypatch):
