@@ -61,6 +61,7 @@ Important files:
 - `youtube-autoencoder.env`: private service configuration.
 - `google-oauth-client.json`: Google OAuth client configuration.
 - `youtube-token.json`: OAuth access and refresh token cache.
+- `youtube-token.json.lock`: mode-`0600` advisory lock serializing access-token refreshes across the encoder, API helper, authorization flow, and optional telemetry.
 - `youtube-live-state.json`: versioned, non-secret lifecycle cache containing exact resource IDs, local create intent, privacy, lifecycle, and retry metadata.
 - `youtube-live-state.lock`: serialized mutation lock for create, bind, transition, privacy, and explicit completion operations.
 - `supervisor.lock`: process-lifetime lock preventing two encoder supervisors from running concurrently.
@@ -131,7 +132,8 @@ See the [recovery state machine](docs/architecture-and-flows.md#recovery-state-m
 | Insert response is lost or ambiguous | The durable `verify_create` intent polls under ambiguous backoff and never issues another insert automatically. |
 | Lifecycle state is missing or corrupt | Legacy markers may be read once for migration; otherwise conflicting same-stream or same-title resources block creation until an operator reconciles ownership. |
 | Ambiguous or unknown remote state | Reconciliation fails closed and creates nothing until the ambiguity is resolved. |
-| OAuth access token expires | API helper refreshes from the stored refresh token. |
+| OAuth access token expires locally or YouTube rejects the cached token with HTTP 401 | The API helper performs one serialized refresh and replays the exact buffered JSON request once. Concurrent helpers reuse the first successful refresh. |
+| OAuth refresh token is missing, invalid, expired, revoked, unreadable, or malformed | API mutation pauses without entering ambiguous backoff. The service waits for the token file to change and resumes automatically after `youtube-autoencoder-api authorize` saves a replacement. If a verified public stream is already running, FFmpeg remains under its local progress watchdog while the control plane is blocked. |
 | Previous broadcast is `complete`, `revoked`, or confirmed missing | One new unlisted generation may be staged after the source probe passes. |
 
 Recovery deadlines survive service and host restarts. Exponential backoff uses these class floors and caps:
@@ -142,6 +144,10 @@ Recovery deadlines survive service and host restarts. Exponential backoff uses t
 | API | 30 seconds | 15 minutes | Network timeout, transient HTTP failure, unavailable API service. |
 | Quota | 15 minutes | 6 hours | `userRequestsExceedRateLimit`, quota errors, HTTP 429. |
 | Ambiguous | 5 minutes | 1 hour | Multiple managed candidates, unknown lifecycle, conflicting state. |
+
+OAuth authorization failures are blocked conditions, not retry classes. They do not consume API quota while the token file is unchanged.
+
+Token refresh serialization uses an advisory `fcntl` lock and therefore requires a local filesystem. Every process that can refresh or replace the token must use the same lock path; override `YTA_YOUTUBE_TOKEN_REFRESH_LOCK_FILE` only when the encoder, helper, authorization command, and telemetry share that exact local path.
 
 The project never sets or updates YouTube `liveBroadcast` or `liveStream` descriptions. Normal recovery validates the exact broadcast ID in the private schema-v3 state file. Before a new insert, the helper persists the required title, scheduled start, privacy, creation window, and stream relationship; if the insert outcome is ambiguous, those fields may identify exactly one remote candidate, but they can never authorize another automatic insert. Legacy description markers are read only during one-way migration from schema v2.
 
@@ -399,6 +405,7 @@ systemctl --user enable --now youtube-autoencoder.service
 | `invalid_client` | OAuth client type does not support the device-code flow. | Create a client for TVs and Limited Input devices, then replace `google-oauth-client.json`. |
 | `authorization_pending` | The browser approval has not completed yet. | Finish the device-code flow; the CLI will keep polling until the code expires. |
 | `slow_down` | Polling is too frequent. | The helper backs off automatically. |
+| `invalid_grant` | The refresh token expired, was revoked, or no longer belongs to the OAuth client. Testing-mode authorizations commonly expire after seven days. | Move the OAuth app to In production for unattended use, rerun `youtube-autoencoder-api authorize`, and select the account that owns or manages the intended channel. The running service detects the saved token and resumes automatically. |
 | Token works briefly then expires | App is still in Testing mode. | Add the correct test user for setup, then move the app to In production for unattended use and complete required verification. |
 | API calls fail despite valid OAuth | The account does not own/manage the YouTube channel, live streaming is not enabled, or quota/policy blocks the operation. | Reauthorize with the right channel account, enable live streaming, and check project quota and YouTube Studio restrictions. |
 
@@ -521,10 +528,12 @@ Each eligible collection performs one [`videos.list`](https://developers.google.
 
 Only the most recent changelog entry is shown here. See `CHANGELOG.md` for full history.
 
-### 2026-07-11 - Description-Neutral Lifecycle Identity
+### 2026-07-14 - OAuth-Blocked Recovery
 
-- New YouTube stream and broadcast inserts omit the description field, and normal lifecycle recovery never updates descriptions.
-- Schema-v3 exact-ID state and a durable create fingerprint retain duplicate-safe recovery; legacy markers are read only for one-way migration.
+- Refresh-token rejection and unusable token files now enter an explicit OAuth-blocked state instead of ambiguous retry backoff.
+- A cached token rejected with HTTP 401 now receives one cross-process serialized refresh and one exact request replay; a second rejection blocks on the post-refresh credential state without looping.
+- The supervisor waits without API calls until token content changes, preserves an already-public FFmpeg stream under its watchdog, and revalidates exact lifecycle state after reauthorization.
+- Device authorization keeps normal termination semantics; child-specific signal handling is limited to the visible test-pattern command.
 
 ## Repository Layout
 

@@ -31,6 +31,10 @@ CLIENT_FILE = pathlib.Path(
     os.environ.get("YTA_YOUTUBE_CLIENT_FILE", BASE_DIR / "google-oauth-client.json")
 ).expanduser()
 TOKEN_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_TOKEN_FILE", BASE_DIR / "youtube-token.json")).expanduser()
+_TOKEN_REFRESH_LOCK_FILE_VALUE = os.environ.get("YTA_YOUTUBE_TOKEN_REFRESH_LOCK_FILE")
+TOKEN_REFRESH_LOCK_FILE = (
+    pathlib.Path(_TOKEN_REFRESH_LOCK_FILE_VALUE).expanduser() if _TOKEN_REFRESH_LOCK_FILE_VALUE else None
+)
 STATE_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_STATE_FILE", BASE_DIR / "youtube-live-state.json")).expanduser()
 LOCK_FILE = pathlib.Path(os.environ.get("YTA_YOUTUBE_LOCK_FILE", BASE_DIR / "youtube-live-state.lock")).expanduser()
 OBS_PROFILE_DIR = pathlib.Path(
@@ -55,6 +59,9 @@ RATE_LIMIT_REASONS = {
     "userRateLimitExceeded",
     "userRequestsExceedRateLimit",
 }
+OAUTH_REQUIRED_REASONS = {"authError", "authorizationRequired", "invalid_grant"}
+OAUTH_CLIENT_FAILURE_REASONS = {"invalid_client", "invalid_scope", "unauthorized_client"}
+TOKEN_FILE_MAX_BYTES = 1024 * 1024
 STATE_SCHEMA_VERSION = 3
 LEGACY_STATE_SCHEMA_VERSION = 2
 RECOVERABLE_STATES = {"created", "ready", "testStarting", "testing", "liveStarting", "live"}
@@ -73,19 +80,29 @@ class YouTubeApiError(RuntimeError):
         reasons: tuple[str, ...],
         message: str,
         retry_after: float | None = None,
+        token_updated: bool = False,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.reasons = reasons
         self.retry_after = retry_after
+        self.token_updated = token_updated
 
     @property
     def retry_class(self) -> str:
+        if any(reason in OAUTH_CLIENT_FAILURE_REASONS for reason in self.reasons):
+            return "fatal"
+        if self.status == 401 or any(reason in OAUTH_REQUIRED_REASONS for reason in self.reasons):
+            return "oauth"
         if self.status == 429 or any(reason in RATE_LIMIT_REASONS for reason in self.reasons):
             return "quota"
         if self.status is None or self.status >= 500:
             return "api"
         return "fatal"
+
+
+class OAuthAuthorizationRequired(RuntimeError):
+    retry_class = "oauth"
 
 
 class ReconciliationError(RuntimeError):
@@ -190,6 +207,23 @@ def mutation_lock(timeout: float | None = None):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextlib.contextmanager
+def token_refresh_lock():
+    """Serialize token refreshes through one advisory lock on local storage."""
+    lock_file = TOKEN_REFRESH_LOCK_FILE or TOKEN_FILE.with_name(f"{TOKEN_FILE.name}.lock")
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
 def error_payload(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, YouTubeApiError):
         return {
@@ -199,6 +233,7 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
             "reasons": list(exc.reasons),
             "retry_after": exc.retry_after,
             "retry_class": exc.retry_class,
+            "token_updated": exc.token_updated,
         }
     retry_class = str(getattr(exc, "retry_class", "fatal"))
     payload = {
@@ -208,6 +243,7 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
         "reasons": [],
         "retry_after": None,
         "retry_class": retry_class,
+        "token_updated": bool(getattr(exc, "token_updated", False)),
     }
     if getattr(exc, "public_fallback_allowed", True) is False:
         payload["public_fallback_allowed"] = False
@@ -329,44 +365,116 @@ def authorize(_args: argparse.Namespace) -> int:
                 continue
             raise
         token_data["created_at"] = int(time.time())
-        write_secret_json(TOKEN_FILE, token_data)
+        with token_refresh_lock():
+            write_secret_json(TOKEN_FILE, token_data)
         print(f"Saved token to {TOKEN_FILE}")
         return 0
     raise TimeoutError("OAuth device code expired before authorization completed")
 
 
-def token() -> str:
-    if not TOKEN_FILE.exists():
-        raise FileNotFoundError("missing token file; run: youtube-autoencoder-api authorize")
-    data = read_json(TOKEN_FILE)
-    expires_at = int(data.get("created_at") or 0) + int(data.get("expires_in") or 0) - 120
-    if data.get("access_token") and time.time() < expires_at:
-        return str(data["access_token"])
+def read_token_snapshot() -> tuple[dict[str, Any], tuple[int, int, int, int]]:
+    try:
+        with TOKEN_FILE.open("rb") as handle:
+            raw = handle.read(TOKEN_FILE_MAX_BYTES + 1)
+            token_stat = os.fstat(handle.fileno())
+    except FileNotFoundError as exc:
+        raise OAuthAuthorizationRequired("missing token file; run: youtube-autoencoder-api authorize") from exc
+    except OSError as exc:
+        raise OAuthAuthorizationRequired(
+            f"could not read token file {TOKEN_FILE}; rerun authorization or fix its permissions"
+        ) from exc
+    if len(raw) > TOKEN_FILE_MAX_BYTES:
+        raise OAuthAuthorizationRequired("token file is too large; rerun authorization")
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise OAuthAuthorizationRequired("invalid token file; rerun authorization") from exc
+    if not isinstance(data, dict):
+        raise OAuthAuthorizationRequired("invalid token file; rerun authorization")
+    revision = (token_stat.st_dev, token_stat.st_ino, token_stat.st_size, token_stat.st_mtime_ns)
+    return data, revision
 
-    refresh_token = str(data.get("refresh_token") or "")
-    if not refresh_token:
-        raise ValueError("token file has no refresh_token; rerun authorization")
-    cfg = client_config()
-    refreshed = http_json(
-        "POST",
-        "https://oauth2.googleapis.com/token",
-        form={
-            "client_id": cfg["client_id"],
-            "client_secret": cfg["client_secret"],
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        },
+
+def read_token_data() -> dict[str, Any]:
+    data, _revision = read_token_snapshot()
+    return data
+
+
+def locally_valid_access_token(data: dict[str, Any]) -> str | None:
+    try:
+        expires_at = int(data.get("created_at") or 0) + int(data.get("expires_in") or 0) - 120
+    except (TypeError, ValueError) as exc:
+        raise OAuthAuthorizationRequired("invalid token expiration metadata; rerun authorization") from exc
+    access_token = str(data.get("access_token") or "")
+    return access_token if access_token and time.time() < expires_at else None
+
+
+def refresh_access_token(
+    rejected_access_token: str,
+    rejected_revision: tuple[int, int, int, int],
+) -> tuple[str, tuple[int, int, int, int], bool]:
+    with token_refresh_lock():
+        data, current_revision = read_token_snapshot()
+        current_access_token = locally_valid_access_token(data)
+        if current_access_token and (
+            current_access_token != rejected_access_token or current_revision != rejected_revision
+        ):
+            return current_access_token, current_revision, True
+
+        refresh_token = str(data.get("refresh_token") or "")
+        if not refresh_token:
+            raise OAuthAuthorizationRequired("token file has no refresh_token; rerun authorization")
+        cfg = client_config()
+        refreshed = http_json(
+            "POST",
+            "https://oauth2.googleapis.com/token",
+            form={
+                "client_id": cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+        data.update(refreshed)
+        data["refresh_token"] = str(refreshed.get("refresh_token") or refresh_token)
+        data["created_at"] = int(time.time())
+        write_secret_json(TOKEN_FILE, data)
+        stored, stored_revision = read_token_snapshot()
+        return str(stored["access_token"]), stored_revision, True
+
+
+def token_for_request() -> tuple[str, tuple[int, int, int, int]]:
+    data, revision = read_token_snapshot()
+    access_token = locally_valid_access_token(data)
+    if access_token:
+        return access_token, revision
+    refreshed_token, refreshed_revision, _updated = refresh_access_token(
+        str(data.get("access_token") or ""),
+        revision,
     )
-    data.update(refreshed)
-    data["refresh_token"] = refresh_token
-    data["created_at"] = int(time.time())
-    write_secret_json(TOKEN_FILE, data)
-    return str(data["access_token"])
+    return refreshed_token, refreshed_revision
+
+
+def token() -> str:
+    access_token, _revision = token_for_request()
+    return access_token
 
 
 def api(method: str, path: str, params: dict[str, str], body: dict[str, Any] | None = None) -> dict[str, Any]:
     query = urllib.parse.urlencode(params)
-    return http_json(method, f"{API_BASE}{path}?{query}", token=token(), body=body)
+    url = f"{API_BASE}{path}?{query}"
+    access_token, revision = token_for_request()
+    try:
+        return http_json(method, url, token=access_token, body=body)
+    except YouTubeApiError as exc:
+        if exc.status != 401 or any(reason in OAUTH_CLIENT_FAILURE_REASONS for reason in exc.reasons):
+            raise
+    refreshed_token, _refreshed_revision, token_updated = refresh_access_token(access_token, revision)
+    try:
+        return http_json(method, url, token=refreshed_token, body=body)
+    except YouTubeApiError as exc:
+        exc.token_updated = token_updated
+        raise
 
 
 def metric_int(value: Any, field: str) -> int | None:
@@ -1364,8 +1472,6 @@ def transition_command(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    signal.signal(signal.SIGTERM, stop_child)
-    signal.signal(signal.SIGINT, stop_child)
     parser = argparse.ArgumentParser(description="Control YouTube Live for YouTube AutoEncoder")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1476,6 +1582,9 @@ def main() -> int:
     clear_retry_p.set_defaults(func=clear_retry_command)
 
     args = parser.parse_args()
+    if args.command == "run-visible-test":
+        signal.signal(signal.SIGTERM, stop_child)
+        signal.signal(signal.SIGINT, stop_child)
     return int(args.func(args))
 
 

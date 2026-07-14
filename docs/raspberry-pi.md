@@ -46,6 +46,7 @@ YTA_INSTANCE_ID=encoder-hostname
 YTA_YOUTUBE_STAGING_PRIVACY=unlisted
 YTA_YOUTUBE_LIVE_PRIVACY=public
 YTA_YOUTUBE_POLL_INTERVAL_SEC=5
+YTA_OAUTH_BLOCKED_POLL_SEC=5
 YTA_FFMPEG_PROGRESS_TIMEOUT_SEC=45
 YTA_YOUTUBE_COMPLETE_ON_EXIT=false
 ```
@@ -65,6 +66,8 @@ sudo -u encoder -H youtube-autoencoder-api authorize
 ```
 
 Approve the device code in a browser for the Google account that owns the YouTube channel.
+
+If YouTube rejects a cached access token with HTTP 401, the helper performs one serialized refresh and replays the exact request once. All refreshers share the mode-`0600` `youtube-token.json.lock` advisory lock, which must remain on local storage. If the refresh token later expires or is revoked, the service enters an OAuth-blocked state without creating or mutating broadcasts. Run the same authorization command again. The service detects the atomically saved replacement token and resumes automatically; no service restart is required.
 
 For a fresh deployment without an existing reusable stream, provision and validate it before enabling the production service:
 

@@ -81,6 +81,7 @@ stateDiagram-v2
         state "Testing, live, and publication gates" as RecoveryGates
         state "Verified public stream" as RecoveryStable
         state "Public stream with API cooldown" as RecoveryPublicFallback
+        state "Public stream waiting for OAuth replacement" as RecoveryPublicOAuthBlocked
 
         [*] --> RecoveryProbe
         RecoveryProbe --> RecoveryReconcile : source available
@@ -92,18 +93,23 @@ stateDiagram-v2
         RecoveryGates --> RecoveryStable : two healthy live observations and privacy readback
         RecoveryStable --> RecoveryPublicFallback : API unavailable, media healthy
         RecoveryPublicFallback --> RecoveryStable : API recovers
+        RecoveryStable --> RecoveryPublicOAuthBlocked : OAuth rejected, media healthy
+        RecoveryPublicOAuthBlocked --> RecoveryStable : token changes and exact IDs revalidate
     }
     state "Persist classified cooldown" as RecoveryBackoff
+    state "Wait for OAuth token replacement" as RecoveryOAuthBlocked
 
     [*] --> RecoveryStartup
     RecoveryStartup --> RecoveryBackoff : retry deadline active
     RecoveryBackoff --> RecoveryStartup : deadline expires or host restarts
     RecoveryStartup --> RecoveryGeneration : no active deadline
     RecoveryGeneration --> RecoveryBackoff : recoverable failure, preserve ownership
+    RecoveryGeneration --> RecoveryOAuthBlocked : OAuth rejected before verified public ingest
+    RecoveryOAuthBlocked --> RecoveryStartup : token content changes
     RecoveryCreate --> RecoveryBackoff : insert outcome uncertain, never reinsert
 ```
 
-The helper never sets or updates YouTube descriptions. Schema-v3 state stores the exact broadcast ID and a write-ahead create fingerprint. A lost insert response enters `verify_create`; recovery may adopt exactly one normalized remote match, but zero or multiple matches stay blocked under durable ambiguous backoff. Legacy description markers are read only for one-way schema-v2 migration.
+The helper never sets or updates YouTube descriptions. Schema-v3 state stores the exact broadcast ID and a write-ahead create fingerprint. A lost insert response enters `verify_create`; recovery may adopt exactly one normalized remote match, but zero or multiple matches stay blocked under durable ambiguous backoff. Cached access tokens rejected with HTTP 401 receive one refresh under a shared local `fcntl` lock and one exact buffered request replay. If that replay is also rejected, the supervisor waits on the post-refresh token fingerprint so its own token write cannot trigger a busy loop. Other OAuth rejection does not enter remote backoff: the service makes no further API calls until the private token file changes. Legacy description markers are read only for one-way schema-v2 migration.
 
 Return to [Recovery Behavior](../README.md#recovery-behavior).
 

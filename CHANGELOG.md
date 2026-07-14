@@ -2,6 +2,16 @@
 
 All notable project changes are recorded here. The README shows only the most recent entry.
 
+## 2026-07-14 - OAuth-Blocked Recovery
+
+- Classified refresh-token `invalid_grant` responses and unusable token files as explicit OAuth authorization blocks instead of ambiguous retry failures.
+- Added a mode-`0600` cross-process refresh lock and a single exact request replay when YouTube rejects a cached access token with HTTP 401.
+- Prevented a second post-refresh 401 from creating a supervisor busy loop by waiting on the post-refresh token fingerprint.
+- Added bounded local credential fingerprinting and signal-interruptible waiting that makes no API calls until token content changes, then resumes automatically.
+- Preserved already-public FFmpeg ingest under its local watchdog during an OAuth block and revalidated the exact cached lifecycle state after reauthorization.
+- Limited custom child-stopping signal handlers to visible test-pattern runs so device authorization terminates normally.
+- Added regression coverage and operator documentation for revoked, missing, malformed, unreadable, and oversized token states.
+
 ## 2026-07-11 - Description-Neutral Lifecycle Identity
 
 - Stopped setting `liveBroadcast` and `liveStream` descriptions; new insert payloads omit the description field entirely and privacy updates remain status-only.

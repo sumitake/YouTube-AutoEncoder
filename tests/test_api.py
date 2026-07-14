@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import io
 import json
 import os
+import threading
+import time
 import urllib.error
 import uuid
 
@@ -170,6 +173,7 @@ def test_http_json_exposes_youtube_error_reason(load_script, monkeypatch):
         "reasons": ["userRequestsExceedRateLimit"],
         "retry_after": 120,
         "retry_class": "quota",
+        "token_updated": False,
     }
 
 
@@ -201,9 +205,242 @@ def test_http_json_preserves_oauth_device_error_reason(load_script, monkeypatch)
     assert str(raised.value) == "The user has not completed authorization."
 
 
+def test_invalid_grant_requires_oauth_reauthorization(load_script):
+    api = load_script("youtube-autoencoder-api", "yta_api_invalid_grant")
+    error = api.YouTubeApiError(
+        status=400,
+        reasons=("invalid_grant",),
+        message="Token has been expired or revoked.",
+    )
+
+    assert error.retry_class == "oauth"
+    assert api.error_payload(error)["retry_class"] == "oauth"
+
+
+@pytest.mark.parametrize(
+    ("status", "reasons", "expected"),
+    [
+        (401, (), "oauth"),
+        (403, ("authError",), "oauth"),
+        (403, ("authorizationRequired",), "oauth"),
+        (400, ("invalid_client",), "fatal"),
+        (401, ("invalid_client",), "fatal"),
+        (400, ("invalid_scope",), "fatal"),
+        (401, ("invalid_scope",), "fatal"),
+        (400, ("unauthorized_client",), "fatal"),
+        (401, ("unauthorized_client",), "fatal"),
+    ],
+)
+def test_oauth_retry_class_distinguishes_token_and_client_failures(
+    load_script,
+    status,
+    reasons,
+    expected,
+):
+    api = load_script("youtube-autoencoder-api", f"yta_api_retry_class_{status}_{expected}_{len(reasons)}")
+    error = api.YouTubeApiError(status=status, reasons=reasons, message="request failed")
+
+    assert error.retry_class == expected
+
+
+def test_api_replays_exact_request_once_after_401(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_replay_401")
+    revision = (1, 2, 3, 4)
+    calls = []
+    refreshes = []
+
+    monkeypatch.setattr(api, "token_for_request", lambda: ("rejected-token", revision))
+
+    def refresh(rejected_access_token, rejected_revision):
+        refreshes.append((rejected_access_token, rejected_revision))
+        return "refreshed-token", (5, 6, 7, 8), True
+
+    def request(method, url, *, token=None, form=None, body=None):
+        calls.append((method, url, token, form, body))
+        if len(calls) == 1:
+            raise api.YouTubeApiError(status=401, reasons=(), message="expired")
+        return {"ok": True}
+
+    monkeypatch.setattr(api, "refresh_access_token", refresh)
+    monkeypatch.setattr(api, "http_json", request)
+
+    body = {"snippet": {"title": "Camera Live"}}
+    assert api.api("POST", "/liveBroadcasts", {"part": "snippet", "id": "abc"}, body=body) == {"ok": True}
+    assert refreshes == [("rejected-token", revision)]
+    assert calls == [
+        (
+            "POST",
+            f"{api.API_BASE}/liveBroadcasts?part=snippet&id=abc",
+            "rejected-token",
+            None,
+            body,
+        ),
+        (
+            "POST",
+            f"{api.API_BASE}/liveBroadcasts?part=snippet&id=abc",
+            "refreshed-token",
+            None,
+            body,
+        ),
+    ]
+
+
+def test_api_second_401_stops_after_one_replay_and_marks_token_updated(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "m401")
+    revision = (1, 2, 3, 4)
+    calls = []
+    monkeypatch.setattr(api, "token_for_request", lambda: ("rejected-token", revision))
+    monkeypatch.setattr(
+        api,
+        "refresh_access_token",
+        lambda *_args: ("refreshed-token", (5, 6, 7, 8), True),
+    )
+
+    def request(*_args, **_kwargs):
+        calls.append(True)
+        raise api.YouTubeApiError(status=401, reasons=("authError",), message="still rejected")
+
+    monkeypatch.setattr(api, "http_json", request)
+
+    with pytest.raises(api.YouTubeApiError) as raised:
+        api.api("GET", "/liveStreams", {"part": "status"})
+
+    assert len(calls) == 2
+    assert raised.value.retry_class == "oauth"
+    assert raised.value.token_updated is True
+    assert api.error_payload(raised.value)["token_updated"] is True
+
+
+def test_api_does_not_replay_non_401_auth_error(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_no_replay_403")
+    monkeypatch.setattr(api, "token_for_request", lambda: ("access-token", (1, 2, 3, 4)))
+    monkeypatch.setattr(
+        api,
+        "refresh_access_token",
+        lambda *_args: pytest.fail("non-401 response attempted token refresh"),
+    )
+
+    def request(*_args, **_kwargs):
+        raise api.YouTubeApiError(status=403, reasons=("authError",), message="forbidden")
+
+    monkeypatch.setattr(api, "http_json", request)
+
+    with pytest.raises(api.YouTubeApiError) as raised:
+        api.api("GET", "/liveStreams", {"part": "status"})
+
+    assert raised.value.retry_class == "oauth"
+    assert raised.value.token_updated is False
+
+
+@pytest.mark.parametrize("reason", ["invalid_client", "invalid_scope", "unauthorized_client"])
+def test_api_does_not_refresh_401_client_error(load_script, monkeypatch, reason):
+    api = load_script("youtube-autoencoder-api", f"client_401_{reason}")
+    monkeypatch.setattr(api, "token_for_request", lambda: ("access-token", (1, 2, 3, 4)))
+    monkeypatch.setattr(
+        api,
+        "refresh_access_token",
+        lambda *_args: pytest.fail("client configuration failure attempted token refresh"),
+    )
+    monkeypatch.setattr(
+        api,
+        "http_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            api.YouTubeApiError(status=401, reasons=(reason,), message="client configuration rejected")
+        ),
+    )
+
+    with pytest.raises(api.YouTubeApiError) as raised:
+        api.api("GET", "/liveStreams", {"part": "status"})
+
+    assert raised.value.retry_class == "fatal"
+    assert raised.value.token_updated is False
+
+
+def test_api_propagates_invalid_grant_without_replay(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_invalid_grant_refresh")
+    calls = []
+    monkeypatch.setattr(api, "token_for_request", lambda: ("access-token", (1, 2, 3, 4)))
+
+    def request(*_args, **_kwargs):
+        calls.append(True)
+        raise api.YouTubeApiError(status=401, reasons=(), message="expired")
+
+    def refresh(*_args):
+        raise api.YouTubeApiError(
+            status=400,
+            reasons=("invalid_grant",),
+            message="refresh token revoked",
+        )
+
+    monkeypatch.setattr(api, "http_json", request)
+    monkeypatch.setattr(api, "refresh_access_token", refresh)
+
+    with pytest.raises(api.YouTubeApiError) as raised:
+        api.api("GET", "/liveStreams", {"part": "status"})
+
+    assert calls == [True]
+    assert raised.value.retry_class == "oauth"
+    assert raised.value.token_updated is False
+
+
+@pytest.mark.parametrize(
+    ("token_data", "message"),
+    [
+        (None, "missing token file"),
+        ({"access_token": "expired", "expires_in": 1, "created_at": 0}, "no refresh_token"),
+    ],
+)
+def test_unusable_token_requires_oauth_reauthorization(load_script, monkeypatch, tmp_path, token_data, message):
+    api = load_script("youtube-autoencoder-api", f"yta_api_unusable_token_{message.replace(' ', '_')}")
+    token_file = tmp_path / "youtube-token.json"
+    if token_data is not None:
+        token_file.write_text(json.dumps(token_data), encoding="utf-8")
+    monkeypatch.setattr(api, "TOKEN_FILE", token_file)
+
+    with pytest.raises(api.OAuthAuthorizationRequired, match=message):
+        api.token()
+
+
+def test_malformed_or_oversized_token_requires_oauth_reauthorization(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_malformed_token")
+    token_file = tmp_path / "youtube-token.json"
+    monkeypatch.setattr(api, "TOKEN_FILE", token_file)
+
+    token_file.write_text("{broken", encoding="utf-8")
+    with pytest.raises(api.OAuthAuthorizationRequired, match="invalid token file"):
+        api.token()
+
+    token_file.write_bytes(b"x" * (api.TOKEN_FILE_MAX_BYTES + 1))
+    with pytest.raises(api.OAuthAuthorizationRequired, match="too large"):
+        api.token()
+
+
+@pytest.mark.parametrize(
+    "token_data",
+    [
+        {"access_token": "access", "created_at": "not-a-number", "expires_in": 3600},
+        {"access_token": "access", "created_at": 0, "expires_in": {"seconds": 3600}},
+    ],
+)
+def test_invalid_token_expiration_metadata_requires_oauth_reauthorization(
+    load_script,
+    monkeypatch,
+    tmp_path,
+    token_data,
+):
+    api = load_script("youtube-autoencoder-api", f"yta_api_invalid_expiry_{type(token_data['expires_in']).__name__}")
+    token_file = tmp_path / "youtube-token.json"
+    token_file.write_text(json.dumps(token_data), encoding="utf-8")
+    monkeypatch.setattr(api, "TOKEN_FILE", token_file)
+
+    with pytest.raises(api.OAuthAuthorizationRequired, match="invalid token expiration metadata"):
+        api.token()
+
+
 def test_authorize_retries_pending_device_flow(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_authorize_pending")
     calls = []
+    lock_entries = []
     responses = iter(
         [
             {
@@ -230,12 +467,21 @@ def test_authorize_retries_pending_device_flow(load_script, monkeypatch, tmp_pat
         return response
 
     monkeypatch.setattr(api, "TOKEN_FILE", tmp_path / "youtube-token.json")
+    monkeypatch.setattr(api, "TOKEN_REFRESH_LOCK_FILE", tmp_path / "youtube-token-refresh.lock")
     monkeypatch.setattr(api, "client_config", lambda: {"client_id": "id", "client_secret": "secret"})
     monkeypatch.setattr(api, "http_json", fake_http)
     monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
 
+    @contextlib.contextmanager
+    def token_lock():
+        lock_entries.append(True)
+        yield
+
+    monkeypatch.setattr(api, "token_refresh_lock", token_lock)
+
     assert api.authorize(argparse.Namespace()) == 0
     assert len(calls) == 3
+    assert lock_entries == [True]
     assert json.loads(api.TOKEN_FILE.read_text(encoding="utf-8"))["refresh_token"] == "refresh"
 
 
@@ -1366,6 +1612,31 @@ def test_visible_test_requires_explicit_complete_flag(load_script, monkeypatch):
     assert seen["complete"] is False
 
 
+def test_authorize_does_not_install_test_pattern_signal_handlers(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_authorize_signals")
+    installed = []
+    monkeypatch.setattr(api.signal, "signal", lambda signum, handler: installed.append((signum, handler)))
+    monkeypatch.setattr(api, "authorize", lambda _args: 0)
+    monkeypatch.setattr(api.sys, "argv", ["youtube-autoencoder-api", "authorize"])
+
+    assert api.main() == 0
+    assert installed == []
+
+
+def test_visible_test_installs_child_signal_handlers(load_script, monkeypatch):
+    api = load_script("youtube-autoencoder-api", "yta_api_visible_test_signals")
+    installed = []
+    monkeypatch.setattr(api.signal, "signal", lambda signum, handler: installed.append((signum, handler)))
+    monkeypatch.setattr(api, "run_visible_test", lambda _args: 0)
+    monkeypatch.setattr(api.sys, "argv", ["youtube-autoencoder-api", "run-visible-test"])
+
+    assert api.main() == 0
+    assert installed == [
+        (api.signal.SIGTERM, api.stop_child),
+        (api.signal.SIGINT, api.stop_child),
+    ]
+
+
 def test_token_refresh_preserves_refresh_token(load_script, monkeypatch, tmp_path):
     api = load_script("youtube-autoencoder-api", "yta_api_token_refresh")
     client_file = tmp_path / "google-oauth-client.json"
@@ -1380,6 +1651,7 @@ def test_token_refresh_preserves_refresh_token(load_script, monkeypatch, tmp_pat
     )
     monkeypatch.setattr(api, "CLIENT_FILE", client_file)
     monkeypatch.setattr(api, "TOKEN_FILE", token_file)
+    monkeypatch.setattr(api, "TOKEN_REFRESH_LOCK_FILE", tmp_path / "youtube-token-refresh.lock")
 
     def fake_http_json(method, url, *, token=None, form=None, body=None):
         assert method == "POST"
@@ -1399,6 +1671,121 @@ def test_token_refresh_preserves_refresh_token(load_script, monkeypatch, tmp_pat
     assert stored["access_token"] == "new-access-token"
     assert stored["refresh_token"] == "refresh-token"
     assert token_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_token_refresh_preserves_rotated_refresh_token(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_rotated_refresh")
+    client_file = tmp_path / "google-oauth-client.json"
+    token_file = tmp_path / "youtube-token.json"
+    client_file.write_text(
+        json.dumps({"installed": {"client_id": "client-id", "client_secret": "client-secret"}}),
+        encoding="utf-8",
+    )
+    api.write_secret_json(
+        token_file,
+        {"access_token": "expired-token", "refresh_token": "old-refresh", "expires_in": 1, "created_at": 0},
+    )
+    monkeypatch.setattr(api, "CLIENT_FILE", client_file)
+    monkeypatch.setattr(api, "TOKEN_FILE", token_file)
+    monkeypatch.setattr(api, "TOKEN_REFRESH_LOCK_FILE", tmp_path / "youtube-token-refresh.lock")
+    monkeypatch.setattr(
+        api,
+        "http_json",
+        lambda *_args, **_kwargs: {
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        },
+    )
+
+    assert api.token() == "new-access-token"
+    assert json.loads(token_file.read_text(encoding="utf-8"))["refresh_token"] == "new-refresh"
+
+
+def test_refresh_coalesces_identical_token_after_atomic_rewrite(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_refresh_same_token_revision")
+    token_file = tmp_path / "youtube-token.json"
+    monkeypatch.setattr(api, "TOKEN_FILE", token_file)
+    monkeypatch.setattr(api, "TOKEN_REFRESH_LOCK_FILE", tmp_path / "youtube-token-refresh.lock")
+    api.write_secret_json(
+        token_file,
+        {
+            "access_token": "same-access-token",
+            "refresh_token": "refresh-token",
+            "expires_in": 1,
+            "created_at": 0,
+        },
+    )
+    _expired_data, rejected_revision = api.read_token_snapshot()
+    api.write_secret_json(
+        token_file,
+        {
+            "access_token": "same-access-token",
+            "refresh_token": "refresh-token",
+            "expires_in": 3600,
+            "created_at": int(time.time()),
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "http_json",
+        lambda *_args, **_kwargs: pytest.fail("coalesced refresh called token endpoint"),
+    )
+
+    access_token, current_revision, token_updated = api.refresh_access_token(
+        "same-access-token",
+        rejected_revision,
+    )
+
+    assert access_token == "same-access-token"
+    assert current_revision != rejected_revision
+    assert token_updated is True
+
+
+def test_concurrent_expired_token_refresh_is_single_flight(load_script, monkeypatch, tmp_path):
+    api = load_script("youtube-autoencoder-api", "yta_api_refresh_single_flight")
+    client_file = tmp_path / "google-oauth-client.json"
+    token_file = tmp_path / "youtube-token.json"
+    client_file.write_text(
+        json.dumps({"installed": {"client_id": "client-id", "client_secret": "client-secret"}}),
+        encoding="utf-8",
+    )
+    api.write_secret_json(
+        token_file,
+        {
+            "access_token": "expired-token",
+            "refresh_token": "refresh-token",
+            "expires_in": 1,
+            "created_at": 0,
+        },
+    )
+    monkeypatch.setattr(api, "CLIENT_FILE", client_file)
+    monkeypatch.setattr(api, "TOKEN_FILE", token_file)
+    monkeypatch.setattr(api, "TOKEN_REFRESH_LOCK_FILE", tmp_path / "youtube-token-refresh.lock")
+    refresh_calls = []
+    call_lock = threading.Lock()
+    start = threading.Barrier(2)
+
+    def fake_http_json(method, url, *, token=None, form=None, body=None):
+        assert method == "POST"
+        assert url == "https://oauth2.googleapis.com/token"
+        assert token is None
+        assert body is None
+        with call_lock:
+            refresh_calls.append(form["refresh_token"])
+        return {"access_token": "new-access-token", "expires_in": 3600}
+
+    def get_token():
+        start.wait(timeout=5)
+        return api.token()
+
+    monkeypatch.setattr(api, "http_json", fake_http_json)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: get_token(), range(2)))
+
+    assert results == ["new-access-token", "new-access-token"]
+    assert refresh_calls == ["refresh-token"]
+    assert api.TOKEN_REFRESH_LOCK_FILE.stat().st_mode & 0o777 == 0o600
 
 
 def test_video_metrics_uses_one_read_only_videos_list_call(load_script, monkeypatch):
