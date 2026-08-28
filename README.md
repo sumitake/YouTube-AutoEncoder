@@ -3,6 +3,7 @@
 [![CI](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/codeql.yml/badge.svg)](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/codeql.yml)
 [![Secret Scan](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/sumitake/YouTube-AutoEncoder/actions/workflows/secret-scan.yml)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](LICENSE)
 
 YouTube AutoEncoder is a headless, self-recovering live-stream bridge for unattended RTSP-style cameras and YouTube Live. It is designed for small Linux hosts such as Raspberry Pi systems where a full OBS desktop stack is too heavy, but where the stream still needs to recover from camera power loss, encoder crashes, network interruptions, host reboots, and YouTube broadcast lifecycle edge cases.
 
